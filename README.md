@@ -18,3 +18,5 @@ This project builds upon the work of alecdvor. Their repository https://github.c
 (slightly more RFC 3927 compliant)
 
 - Removed unused VLAN code and references
+
+![image](https://github.com/user-attachments/assets/22da352e-f08f-47ba-8de0-ed933dc84b91)
