@@ -162,6 +162,27 @@ function Get-NetworkInterface {
     }
 }
 
+
+function HasInternet {
+
+    param (
+        [string]$selectedInterfaceIP
+    )
+
+    $destination = "www.google.com"
+
+    # Use ping command with -S parameter to specify source address
+    $pingResult = ping -S $selectedInterfaceIP -n 2 $destination
+
+    if ($pingResult -match "Reply from") {
+        return $true
+    }
+    else {
+        return $false
+    }
+}
+
+
 # Function to get selected interface info
 function Get-SelectedInterfaceInfo {
     $selectedInterface = $listBoxInterfaces.SelectedItem
@@ -185,7 +206,6 @@ function Get-SelectedInterfaceInfo {
             Write-Host "Retrieving IPv4 addresses"
             $ipv4Addresses = (Get-NetIPAddress -InterfaceAlias $selectedInterface -AddressFamily IPv4).IPAddress
             $ipv4SubnetMask = (Get-NetIPAddress -InterfaceAlias $selectedInterface -AddressFamily IPv4).PrefixLength
-
             Write-Host "Retrieving IPv6 addresses"
             $ipv6Addresses = (Get-NetIPAddress -InterfaceAlias $selectedInterface -AddressFamily IPv6).IPAddress
 
@@ -193,12 +213,24 @@ function Get-SelectedInterfaceInfo {
             $infoText += "IPv4 Subnet Mask: $ipv4SubnetMask`r`n"
             $infoText += "IPv6 Addresses: $($ipv6Addresses -join ', ')`r`n"
 
-            Write-Host "Checking internet connection"
-            $internetConnection = Test-Connection -ComputerName "www.google.com" -Count 2 -Quiet
-            $internetStatus = if ($internetConnection) { "Connected" } else { "Disconnected" }
-            $infoText += "Internet Connection: $internetStatus`r`n"
+            try {
+                $selectedInterfaceIP = [System.Net.IPAddress]::Parse($ipv4Addresses)
+                Write-Host "Selected Interface IP: $selectedInterfaceIP"
+                
+                $internetResult = HasInternet -selectedInterfaceIP $selectedInterfaceIP
 
-            $infoText += "MAC Address: $($interfaceInfo.MacAddress)`r`n"
+                if ($internetResult) {
+                    $infoText += "Internet Connection: Success`r`n"
+                }
+                else {
+                    $infoText += "Internet Connection: Failed`r`n"
+                }
+            }
+            catch {
+                # Will fail the IPAddress parse if interface is disabled
+                Write-Host "Error: $_"
+                $infoText += "Error retrieving internet connection status`r`n"
+            }
 
             ButtonGroupEnable($true)
 
