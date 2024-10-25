@@ -5,15 +5,15 @@ Tool to quickly change Windows network interface settings
 This project builds upon the work of alecdvor. Their repository https://github.com/alecdvor/netChanger/ provided the foundation for this project.
 
 ## Changes Made
-- Add hide console window
+- Hide the console window
 - Add check for admin rights
-- Add try to launch as admin method
-- Add subnet mask feature
+- Add 'try to re-launch as admin' method
+- Add subnet mask feature and GUI element
 - GUI Improvements
 (perception of responsiveness, disable buttons when busy)
 
-- Change function name (unapproved verb warning)
-- Add debugging prints
+- Change function name (to clear an unapproved verb warning)
+- Add debugging prints.  These print when the console is shown.
 - Changed "Force Link Local" to check for address availiability first
 (slightly more RFC 3927 compliant)
 
