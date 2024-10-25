@@ -4,6 +4,8 @@ Tool to quickly change Windows network interface settings
 ## Acknowledgments
 This project builds upon the work of alecdvor. Their repository https://github.com/alecdvor/netChanger/ provided the foundation for this project.
 
+![image](https://github.com/user-attachments/assets/22da352e-f08f-47ba-8de0-ed933dc84b91)
+
 ## Changes Made
 - Hide the console window
 - Add check for admin rights
@@ -19,4 +21,4 @@ This project builds upon the work of alecdvor. Their repository https://github.c
 
 - Removed unused VLAN code and references
 
-![image](https://github.com/user-attachments/assets/22da352e-f08f-47ba-8de0-ed933dc84b91)
+
