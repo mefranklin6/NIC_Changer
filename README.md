@@ -6,10 +6,16 @@ Tool to quickly change Windows network interface settings
 
 Windows-Native GUI interface built for Audio Visual technicians or anyone who needs to quickly switch between DHCP, Link-Local, and Static IP addresses.
 
-This is essentially one large powershell script with no additional dependencies. Just run the .ps1 file and elevate to admin when prompted.
+This is essentially one large powershell script with no additional dependencies.
 
 ![app picture](/assets/app_pic.png)
 ![subnet scan](/assets/subnet_scan.png)
+
+## Quickstart
+
+All you need to is run `NIC_Changer.ps1`.
+
+If you have issues due to security settings, simply copy the code from `NIC_Changer.ps1` into Notepad, then save the file as `File name: NIC_Changer.ps1` and `Save as type: All files (*.*)`
 
 ## Acknowledgments
 
