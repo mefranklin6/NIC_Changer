@@ -75,10 +75,21 @@ $btnCaptureIP.Add_Click({
 $textBoxCapturedIP = New-Object System.Windows.Forms.TextBox
 $textBoxCapturedIP.Location = New-Object System.Drawing.Point(120, 260)
 $textBoxCapturedIP.Size = New-Object System.Drawing.Size(120, 30)
-$textBoxCapturedIP.Text = 'IP Address'
+$textBoxCapturedIP.Text = ''
 $textBoxCapturedIP.Add_TextChanged({
-        $CapturedIPs[$listBoxInterfaces.SelectedItem] = $textBoxCapturedIP.Text
-        $btnCaptureIPtoSet.Text = "Set IP to $($textBoxCapturedIP.Text)"
+        $selectedInterface = $listBoxInterfaces.SelectedItem
+        $enteredIP = $textBoxCapturedIP.Text.Trim()
+
+        if ($selectedInterface) {
+            if ([string]::IsNullOrWhiteSpace($enteredIP)) {
+                $CapturedIPs.Remove($selectedInterface)
+            }
+            else {
+                $CapturedIPs[$selectedInterface] = $enteredIP
+            }
+        }
+
+        Update-CapturedIPButton
     })
 
 $btnCaptureIPtoSet = New-Object System.Windows.Forms.Button
@@ -121,9 +132,32 @@ function ButtonGroupEnable {
     param(
         [bool]$enable
     )
-    foreach ($button in $ButtonGroup) {
-        $button.Enabled = $enable
+    $interfaceSelected = $null -ne $listBoxInterfaces.SelectedItem
+    $buttonsEnabled = $enable -and $interfaceSelected -and $runningAsAdmin
+
+    $btnSetLinkLocal.Enabled = $buttonsEnabled
+    $btnSetDhcpLinkLocal.Enabled = $buttonsEnabled
+    $btnCaptureIP.Enabled = $buttonsEnabled
+    Update-CapturedIPButton -EnableGroup:$enable
+}
+
+function Update-CapturedIPButton {
+    param(
+        [bool]$EnableGroup = $true
+    )
+
+    $enteredIP = $textBoxCapturedIP.Text.Trim()
+    $hasIP = -not [string]::IsNullOrWhiteSpace($enteredIP)
+    $interfaceSelected = $null -ne $listBoxInterfaces.SelectedItem
+
+    if ($hasIP) {
+        $btnCaptureIPtoSet.Text = "Set IP to $enteredIP"
     }
+    else {
+        $btnCaptureIPtoSet.Text = "Capture or Input IP to Set"
+    }
+
+    $btnCaptureIPtoSet.Enabled = $EnableGroup -and $interfaceSelected -and $runningAsAdmin -and $hasIP
 }
 
 
@@ -163,22 +197,22 @@ function Get-NetworkInterface {
 }
 
 
-function HasInternet {
-
+function Get-ConnectivityStatus {
     param (
         [string]$selectedInterfaceIP
     )
 
-    $destination = "www.google.com"
+    # Test an IP address first so the internet check does not depend on DNS.
+    & ping.exe -S $selectedInterfaceIP -n 2 -w 1000 1.1.1.1 *> $null
+    $ipReachable = $LASTEXITCODE -eq 0
 
-    # Use ping command with -S parameter to specify source address
-    $pingResult = ping -S $selectedInterfaceIP -n 2 $destination
+    # A successful hostname ping proves both connectivity and DNS resolution.
+    & ping.exe -S $selectedInterfaceIP -n 2 -w 1000 www.cloudflare.com *> $null
+    $dnsReachable = $LASTEXITCODE -eq 0
 
-    if ($pingResult -match "Reply from") {
-        return $true
-    }
-    else {
-        return $false
+    return [PSCustomObject]@{
+        Internet = $ipReachable -or $dnsReachable
+        DNS      = $dnsReachable
     }
 }
 
@@ -217,13 +251,20 @@ function Get-SelectedInterfaceInfo {
                 $selectedInterfaceIP = [System.Net.IPAddress]::Parse($ipv4Addresses)
                 Write-Host "Selected Interface IP: $selectedInterfaceIP"
                 
-                $internetResult = HasInternet -selectedInterfaceIP $selectedInterfaceIP
+                $connectivityStatus = Get-ConnectivityStatus -selectedInterfaceIP $selectedInterfaceIP
 
-                if ($internetResult) {
+                if ($connectivityStatus.Internet) {
                     $infoText += "Internet Connection: Success`r`n"
                 }
                 else {
                     $infoText += "Internet Connection: Failed`r`n"
+                }
+
+                if ($connectivityStatus.DNS) {
+                    $infoText += "DNS Resolution: Success`r`n"
+                }
+                else {
+                    $infoText += "DNS Resolution: Failed`r`n"
                 }
             }
             catch {
@@ -369,6 +410,8 @@ $form.Controls.Add($textBoxCapturedSubnet)
 $form.Controls.Add($btnSetLinkLocal)
 $form.Controls.Add($btnSetDhcpLinkLocal)
 
+# Keep interface actions disabled until the user selects an interface.
+ButtonGroupEnable($false)
 
 # Set form event handler
 $form.Add_Shown({
@@ -377,5 +420,3 @@ $form.Add_Shown({
 
 # Display the form
 [Windows.Forms.Application]::Run($form)
-Start-Sleep -Seconds 1
-ButtonGroupEnable($false)
