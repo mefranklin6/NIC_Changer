@@ -3229,7 +3229,7 @@ function Set-DHCP-LinkLocal-IP {
     $selectedInterface = $script:selectedInterface
 
     if ($selectedInterface -ne $null) {
-        Write-Host "Setting DHCP IP for $($selectedInterface)"
+        # Write-Host "Setting DHCP IP for $($selectedInterface)"
 
         # Set DHCP IP for the selected interface using Netsh
         try {
@@ -3497,7 +3497,7 @@ function Get-SelectedInterfaceInfo {
     $selectedInterface = $script:selectedInterface
 
     if ($selectedInterface) {
-        Write-Host "Selected interface: $selectedInterface"
+        #Write-Host "Selected interface: $selectedInterface"
         $script:selectedAdapterHasIPv4 = $false
         ButtonGroupEnable($false)
         $form.UseWaitCursor = $true
@@ -3514,7 +3514,7 @@ function Get-SelectedInterfaceInfo {
         $form.Refresh()
 
         try {
-            Write-Host "Retrieving interface information"
+            # Write-Host "Retrieving interface information"
             $interfaceInfo = Get-NetAdapter | Where-Object { $_.InterfaceAlias -eq $selectedInterface }
 
             if (-not $interfaceInfo) {
@@ -3540,11 +3540,11 @@ function Get-SelectedInterfaceInfo {
                 Set-StatusCard -Card $adapterStatusCard -Text $interfaceInfo.Status -State Failure
             }
 
-            Write-Host "Retrieving IPv4 addresses"
+            #Write-Host "Retrieving IPv4 addresses"
             $ipv4Info = @(Get-NetIPAddress -InterfaceAlias $selectedInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue)
             $ipv4Addresses = @($ipv4Info | ForEach-Object { $_.IPAddress })
             $ipv4SubnetMask = @($ipv4Info | ForEach-Object { $_.PrefixLength })
-            Write-Host "Retrieving IPv6 addresses"
+            #Write-Host "Retrieving IPv6 addresses"
             $ipv6Addresses = @(Get-NetIPAddress -InterfaceAlias $selectedInterface -AddressFamily IPv6 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
 
             $lblIPv4Value.Text = if ($ipv4Addresses.Count -gt 0) { $ipv4Addresses -join ', ' } else { 'No IPv4 address' }
@@ -3554,7 +3554,7 @@ function Get-SelectedInterfaceInfo {
             if ($ipv4Addresses.Count -gt 0) {
                 $script:selectedAdapterHasIPv4 = $true
                 $selectedInterfaceIP = [System.Net.IPAddress]::Parse($ipv4Addresses[0])
-                Write-Host "Selected Interface IP: $selectedInterfaceIP"
+                #Write-Host "Selected Interface IP: $selectedInterfaceIP"
 
                 $connectivityStatus = Get-ConnectivityStatus -selectedInterfaceIP $selectedInterfaceIP
 
@@ -3580,7 +3580,7 @@ function Get-SelectedInterfaceInfo {
                 Set-StatusCard -Card $dhcpStatusCard -Text 'No IPv4' -State Neutral
             }
 
-            Write-Host "Setting Capture to Set button text"
+            #Write-Host "Setting Capture to Set button text"
             if ($CapturedIPs.ContainsKey($selectedInterface)) {
                 $textBoxCapturedIP.Text = $CapturedIPs[$selectedInterface]
             }
@@ -3624,7 +3624,7 @@ function Capture-Current-IPv4 {
             [Windows.Forms.MessageBox]::Show('This adapter does not currently have an IPv4 address.', 'No IPv4 Address') | Out-Null
             return
         }
-        Write-Host "Captured current IPv4 for $($selectedInterface): $($currentIPv4)"
+        # Write-Host "Captured current IPv4 for $($selectedInterface): $($currentIPv4)"
 
         # Store the captured IPv4 in a variable unique to the adapter
         $CapturedIPs[$selectedInterface] = $currentIPv4
@@ -3662,7 +3662,7 @@ function Set-Captured-IP {
             return
         }
 
-        Write-Host "Setting IP for $($selectedInterface): $($capturedIP)"
+        # Write-Host "Setting IP for $($selectedInterface): $($capturedIP)"
 
         $desired_subnet = ValidateSubnetMask($textBoxCapturedSubnet.Text)
         if ($null -eq $desired_subnet) {
@@ -3674,7 +3674,7 @@ function Set-Captured-IP {
             ) | Out-Null
             return
         }
-        Write-Host "Desired subnet: $desired_subnet"
+        # Write-Host "Desired subnet: $desired_subnet"
 
         $currentIPv4Addresses = @(Get-NetIPAddress -InterfaceAlias $selectedInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
         $addressAlreadyOnAdapter = $currentIPv4Addresses -contains $capturedIP
@@ -3718,7 +3718,7 @@ function Set-RandomLinkLocal-IP {
     $selectedInterface = $script:selectedInterface
 
     if ($selectedInterface -ne $null) {
-        Write-Host "Setting Random Link Local IP for $($selectedInterface)"
+        # Write-Host "Setting Random Link Local IP for $($selectedInterface)"
 
         $ipInUse = $true
         while ($ipInUse) {
@@ -3732,7 +3732,7 @@ function Set-RandomLinkLocal-IP {
                 $ipInUse = $false
             }
             else {
-                Write-Host "IP address $randomIp is in use. Generating a new one..."
+                # Write-Host "IP address $randomIp is in use. Generating a new one..."
             }
         }
 
