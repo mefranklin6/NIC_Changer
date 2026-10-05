@@ -29,6 +29,626 @@ public class NICChangerNativeV2 {
 "@
 }
 
+# A small in-process DHCPv4 implementation keeps the utility dependency-free.
+# It is deliberately limited to the directly connected IPv4 subnet selected in
+# the UI; relay-agent requests are ignored.
+if (-not ('NICChangerDhcpServer' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+public sealed class NICChangerDhcpProbeResult
+{
+    public bool ServerFound { get; set; }
+    public string ServerIdentifier { get; set; }
+    public string SourceAddress { get; set; }
+    public string Error { get; set; }
+}
+
+public sealed class NICChangerDhcpLeaseView
+{
+    public string IPAddress { get; set; }
+    public string MacAddress { get; set; }
+    public string HostName { get; set; }
+    public string Status { get; set; }
+    public DateTime LeasedAt { get; set; }
+    public DateTime ExpiresAt { get; set; }
+}
+
+internal sealed class NICChangerDhcpLeaseEntry
+{
+    public string ClientKey;
+    public uint Address;
+    public string MacAddress;
+    public string HostName;
+    public string Status;
+    public DateTime LeasedAt;
+    public DateTime ExpiresAt;
+}
+
+internal sealed class NICChangerDhcpOffer
+{
+    public uint Address;
+    public DateTime ExpiresAt;
+}
+
+internal static class NICChangerDhcpProtocol
+{
+    internal static uint ReadUInt32(byte[] bytes, int offset)
+    {
+        return ((uint)bytes[offset] << 24) | ((uint)bytes[offset + 1] << 16) |
+               ((uint)bytes[offset + 2] << 8) | bytes[offset + 3];
+    }
+
+    internal static void WriteUInt32(byte[] bytes, int offset, uint value)
+    {
+        bytes[offset] = (byte)(value >> 24);
+        bytes[offset + 1] = (byte)(value >> 16);
+        bytes[offset + 2] = (byte)(value >> 8);
+        bytes[offset + 3] = (byte)value;
+    }
+
+    internal static uint AddressToUInt32(IPAddress address)
+    {
+        byte[] bytes = address.GetAddressBytes();
+        return ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) |
+               ((uint)bytes[2] << 8) | bytes[3];
+    }
+
+    internal static IPAddress UInt32ToAddress(uint value)
+    {
+        return new IPAddress(new byte[] {
+            (byte)(value >> 24), (byte)(value >> 16),
+            (byte)(value >> 8), (byte)value
+        });
+    }
+
+    internal static byte[] FindOption(byte[] packet, int length, byte code)
+    {
+        if (length < 240 || packet[236] != 99 || packet[237] != 130 ||
+            packet[238] != 83 || packet[239] != 99) return null;
+
+        int index = 240;
+        while (index < length)
+        {
+            byte optionCode = packet[index++];
+            if (optionCode == 255) break;
+            if (optionCode == 0) continue;
+            if (index >= length) break;
+            int optionLength = packet[index++];
+            if (index + optionLength > length) break;
+            if (optionCode == code)
+            {
+                byte[] value = new byte[optionLength];
+                Buffer.BlockCopy(packet, index, value, 0, optionLength);
+                return value;
+            }
+            index += optionLength;
+        }
+        return null;
+    }
+
+    internal static string FormatMac(byte[] packet, int length)
+    {
+        int macLength = length > 2 ? Math.Min((int)packet[2], 16) : 0;
+        if (length < 28 + macLength || macLength == 0) return "Unknown";
+        StringBuilder builder = new StringBuilder();
+        for (int index = 0; index < macLength; index++)
+        {
+            if (index > 0) builder.Append('-');
+            builder.Append(packet[28 + index].ToString("X2"));
+        }
+        return builder.ToString();
+    }
+
+    internal static string GetClientKey(byte[] packet, int length)
+    {
+        byte[] clientIdentifier = FindOption(packet, length, 61);
+        if (clientIdentifier != null && clientIdentifier.Length > 0)
+            return "ID:" + BitConverter.ToString(clientIdentifier);
+        return "MAC:" + FormatMac(packet, length);
+    }
+
+    internal static string GetHostName(byte[] packet, int length)
+    {
+        byte[] hostName = FindOption(packet, length, 12);
+        if (hostName == null || hostName.Length == 0) return "";
+        string value = Encoding.ASCII.GetString(hostName).Trim();
+        StringBuilder safe = new StringBuilder();
+        foreach (char character in value)
+        {
+            if (character >= 32 && character <= 126) safe.Append(character);
+        }
+        return safe.ToString();
+    }
+
+    internal static void AddOption(List<byte> packet, byte code, byte[] value)
+    {
+        if (value == null || value.Length == 0 || value.Length > 255) return;
+        packet.Add(code);
+        packet.Add((byte)value.Length);
+        packet.AddRange(value);
+    }
+
+    internal static byte[] UInt32Bytes(uint value)
+    {
+        return new byte[] {
+            (byte)(value >> 24), (byte)(value >> 16),
+            (byte)(value >> 8), (byte)value
+        };
+    }
+
+    internal static byte[] AddressListBytes(IPAddress[] addresses)
+    {
+        List<byte> result = new List<byte>();
+        if (addresses != null)
+        {
+            foreach (IPAddress address in addresses) result.AddRange(address.GetAddressBytes());
+        }
+        return result.ToArray();
+    }
+}
+
+public static class NICChangerDhcpProbe
+{
+    public static NICChangerDhcpProbeResult Probe(int interfaceIndex, string broadcastAddress, int timeoutMilliseconds)
+    {
+        NICChangerDhcpProbeResult result = new NICChangerDhcpProbeResult();
+        Socket socket = null;
+        try
+        {
+            socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            socket.ExclusiveAddressUse = false;
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
+            socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true);
+            socket.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31,
+                IPAddress.HostToNetworkOrder(interfaceIndex));
+            socket.Bind(new IPEndPoint(IPAddress.Any, 68));
+            socket.ReceiveTimeout = 350;
+            IPAddress probeDestination = IPAddress.Parse(broadcastAddress);
+
+            byte[] request = new byte[253];
+            request[0] = 1;
+            request[1] = 1;
+            request[2] = 6;
+            byte[] transactionBytes = Guid.NewGuid().ToByteArray();
+            Buffer.BlockCopy(transactionBytes, 0, request, 4, 4);
+            request[10] = 128;
+            request[28] = 2;
+            Buffer.BlockCopy(transactionBytes, 4, request, 29, 5);
+            request[236] = 99; request[237] = 130; request[238] = 83; request[239] = 99;
+            request[240] = 53; request[241] = 1; request[242] = 1;
+            request[243] = 61; request[244] = 7; request[245] = 1;
+            Buffer.BlockCopy(request, 28, request, 246, 6);
+            request[252] = 255;
+
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+            DateTime nextSend = DateTime.MinValue;
+            while (DateTime.UtcNow < deadline)
+            {
+                if (DateTime.UtcNow >= nextSend)
+                {
+                    socket.SendTo(request, new IPEndPoint(probeDestination, 67));
+                    nextSend = DateTime.UtcNow.AddMilliseconds(900);
+                }
+
+                try
+                {
+                    byte[] response = new byte[1500];
+                    EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+                    SocketFlags flags = SocketFlags.None;
+                    IPPacketInformation packetInformation;
+                    int received = socket.ReceiveMessageFrom(response, 0, response.Length, ref flags,
+                        ref remote, out packetInformation);
+                    if (packetInformation.Interface != 0 && packetInformation.Interface != interfaceIndex) continue;
+                    if (received < 244 || response[0] != 2) continue;
+                    bool transactionMatches = true;
+                    for (int index = 0; index < 4; index++)
+                        if (response[4 + index] != request[4 + index]) transactionMatches = false;
+                    if (!transactionMatches) continue;
+
+                    byte[] messageType = NICChangerDhcpProtocol.FindOption(response, received, 53);
+                    if (messageType == null || messageType.Length != 1 ||
+                        (messageType[0] != 2 && messageType[0] != 5)) continue;
+
+                    byte[] serverIdentifier = NICChangerDhcpProtocol.FindOption(response, received, 54);
+                    result.ServerFound = true;
+                    result.SourceAddress = ((IPEndPoint)remote).Address.ToString();
+                    result.ServerIdentifier = serverIdentifier != null && serverIdentifier.Length == 4
+                        ? new IPAddress(serverIdentifier).ToString()
+                        : result.SourceAddress;
+                    return result;
+                }
+                catch (SocketException exception)
+                {
+                    if (exception.SocketErrorCode != SocketError.TimedOut &&
+                        exception.SocketErrorCode != SocketError.WouldBlock) throw;
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            result.Error = exception.Message;
+        }
+        finally
+        {
+            if (socket != null) socket.Close();
+        }
+        return result;
+    }
+}
+
+public sealed class NICChangerDhcpServer : IDisposable
+{
+    private readonly object _sync = new object();
+    private readonly IPAddress _serverAddress;
+    private readonly uint _serverAddressValue;
+    private readonly IPAddress _broadcastAddress;
+    private readonly int _interfaceIndex;
+    private readonly uint _poolStart;
+    private readonly uint _poolEnd;
+    private readonly IPAddress _subnetMask;
+    private readonly IPAddress _router;
+    private readonly IPAddress[] _dnsServers;
+    private readonly IPAddress[] _ntpServers;
+    private readonly string _domainName;
+    private readonly uint _leaseSeconds;
+    private readonly List<NICChangerDhcpLeaseEntry> _leases = new List<NICChangerDhcpLeaseEntry>();
+    private readonly Dictionary<string, NICChangerDhcpOffer> _offers = new Dictionary<string, NICChangerDhcpOffer>();
+    private readonly Dictionary<uint, DateTime> _declined = new Dictionary<uint, DateTime>();
+    private Socket _socket;
+    private Thread _thread;
+    private volatile bool _running;
+    private string _lastError = "";
+
+    public NICChangerDhcpServer(string serverAddress, int interfaceIndex, string poolStart, int poolSize,
+        string subnetMask, string router, string[] dnsServers, string[] ntpServers,
+        string domainName, int leaseMinutes)
+    {
+        if (poolSize < 1) throw new ArgumentOutOfRangeException("poolSize");
+        _serverAddress = IPAddress.Parse(serverAddress);
+        _serverAddressValue = NICChangerDhcpProtocol.AddressToUInt32(_serverAddress);
+        _interfaceIndex = interfaceIndex;
+        _poolStart = NICChangerDhcpProtocol.AddressToUInt32(IPAddress.Parse(poolStart));
+        _poolEnd = checked(_poolStart + (uint)poolSize - 1);
+        _subnetMask = IPAddress.Parse(subnetMask);
+        uint maskValue = NICChangerDhcpProtocol.AddressToUInt32(_subnetMask);
+        _broadcastAddress = NICChangerDhcpProtocol.UInt32ToAddress(
+            (_serverAddressValue & maskValue) | ~maskValue);
+        _router = String.IsNullOrWhiteSpace(router) ? null : IPAddress.Parse(router);
+        _dnsServers = ParseAddresses(dnsServers);
+        _ntpServers = ParseAddresses(ntpServers);
+        _domainName = domainName == null ? "" : domainName.Trim();
+        _leaseSeconds = checked((uint)leaseMinutes * 60U);
+    }
+
+    public bool IsRunning { get { return _running; } }
+    public string LastError { get { lock (_sync) { return _lastError; } } }
+
+    private static IPAddress[] ParseAddresses(string[] values)
+    {
+        List<IPAddress> result = new List<IPAddress>();
+        if (values != null)
+        {
+            foreach (string value in values)
+                if (!String.IsNullOrWhiteSpace(value)) result.Add(IPAddress.Parse(value));
+        }
+        return result.ToArray();
+    }
+
+    public void Start()
+    {
+        lock (_sync)
+        {
+            if (_running) return;
+            _lastError = "";
+            _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            try
+            {
+                _socket.ExclusiveAddressUse = false;
+                _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Broadcast, true);
+                _socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.PacketInformation, true);
+                _socket.SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31,
+                    IPAddress.HostToNetworkOrder(_interfaceIndex));
+                _socket.ReceiveTimeout = 500;
+                _socket.Bind(new IPEndPoint(IPAddress.Any, 67));
+                _running = true;
+                _thread = new Thread(ListenLoop);
+                _thread.IsBackground = true;
+                _thread.Name = "NIC Changer DHCP server";
+                _thread.Start();
+            }
+            catch
+            {
+                _socket.Close();
+                _socket = null;
+                throw;
+            }
+        }
+    }
+
+    public void Stop()
+    {
+        Thread thread;
+        lock (_sync)
+        {
+            _running = false;
+            if (_socket != null)
+            {
+                try { _socket.Close(); } catch { }
+                _socket = null;
+            }
+            thread = _thread;
+            _thread = null;
+        }
+        if (thread != null && thread != Thread.CurrentThread) thread.Join(1500);
+    }
+
+    public NICChangerDhcpLeaseView[] GetLeases()
+    {
+        lock (_sync)
+        {
+            Cleanup(DateTime.UtcNow);
+            List<NICChangerDhcpLeaseView> result = new List<NICChangerDhcpLeaseView>();
+            foreach (NICChangerDhcpLeaseEntry lease in _leases)
+            {
+                result.Add(new NICChangerDhcpLeaseView {
+                    IPAddress = NICChangerDhcpProtocol.UInt32ToAddress(lease.Address).ToString(),
+                    MacAddress = lease.MacAddress,
+                    HostName = lease.HostName,
+                    Status = lease.Status,
+                    LeasedAt = lease.LeasedAt.ToLocalTime(),
+                    ExpiresAt = lease.ExpiresAt.ToLocalTime()
+                });
+            }
+            return result.ToArray();
+        }
+    }
+
+    private void ListenLoop()
+    {
+        try
+        {
+            while (_running)
+            {
+                try
+                {
+                    byte[] packet = new byte[1500];
+                    EndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+                    SocketFlags flags = SocketFlags.None;
+                    IPPacketInformation packetInformation;
+                    int received = _socket.ReceiveMessageFrom(packet, 0, packet.Length, ref flags,
+                        ref remote, out packetInformation);
+                    if (packetInformation.Interface != _interfaceIndex) continue;
+                    HandlePacket(packet, received);
+                }
+                catch (SocketException exception)
+                {
+                    if (!_running) break;
+                    if (exception.SocketErrorCode != SocketError.TimedOut &&
+                        exception.SocketErrorCode != SocketError.WouldBlock) throw;
+                }
+                catch (ObjectDisposedException) { if (!_running) break; }
+            }
+        }
+        catch (Exception exception)
+        {
+            lock (_sync) { _lastError = exception.Message; }
+            _running = false;
+        }
+    }
+
+    private void HandlePacket(byte[] packet, int length)
+    {
+        if (length < 244 || packet[0] != 1 || packet[1] != 1 || packet[2] == 0) return;
+        if (NICChangerDhcpProtocol.ReadUInt32(packet, 24) != 0) return;
+        byte[] messageTypeOption = NICChangerDhcpProtocol.FindOption(packet, length, 53);
+        if (messageTypeOption == null || messageTypeOption.Length != 1) return;
+
+        byte messageType = messageTypeOption[0];
+        string clientKey = NICChangerDhcpProtocol.GetClientKey(packet, length);
+        string macAddress = NICChangerDhcpProtocol.FormatMac(packet, length);
+        string hostName = NICChangerDhcpProtocol.GetHostName(packet, length);
+
+        if (messageType == 1)
+        {
+            uint address;
+            lock (_sync)
+            {
+                address = SelectAddress(clientKey, DateTime.UtcNow);
+                if (address == 0) return;
+                _offers[clientKey] = new NICChangerDhcpOffer {
+                    Address = address, ExpiresAt = DateTime.UtcNow.AddSeconds(60)
+                };
+            }
+            SendReply(packet, length, 2, address);
+        }
+        else if (messageType == 3)
+        {
+            byte[] requestedServer = NICChangerDhcpProtocol.FindOption(packet, length, 54);
+            if (requestedServer != null && requestedServer.Length == 4 &&
+                NICChangerDhcpProtocol.ReadUInt32(requestedServer, 0) != _serverAddressValue)
+            {
+                lock (_sync) { _offers.Remove(clientKey); }
+                return;
+            }
+
+            byte[] requestedAddressOption = NICChangerDhcpProtocol.FindOption(packet, length, 50);
+            uint requestedAddress = requestedAddressOption != null && requestedAddressOption.Length == 4
+                ? NICChangerDhcpProtocol.ReadUInt32(requestedAddressOption, 0)
+                : NICChangerDhcpProtocol.ReadUInt32(packet, 12);
+
+            bool accepted;
+            lock (_sync)
+            {
+                Cleanup(DateTime.UtcNow);
+                accepted = requestedAddress >= _poolStart && requestedAddress <= _poolEnd &&
+                    !AddressBelongsToOtherClient(requestedAddress, clientKey);
+                if (accepted) CommitLease(clientKey, requestedAddress, macAddress, hostName);
+                _offers.Remove(clientKey);
+            }
+            SendReply(packet, length, accepted ? (byte)5 : (byte)6, accepted ? requestedAddress : 0);
+        }
+        else if (messageType == 4)
+        {
+            byte[] declinedAddress = NICChangerDhcpProtocol.FindOption(packet, length, 50);
+            if (declinedAddress != null && declinedAddress.Length == 4)
+            {
+                uint address = NICChangerDhcpProtocol.ReadUInt32(declinedAddress, 0);
+                lock (_sync) { _declined[address] = DateTime.UtcNow.AddMinutes(10); }
+            }
+        }
+        else if (messageType == 7)
+        {
+            lock (_sync)
+            {
+                foreach (NICChangerDhcpLeaseEntry lease in _leases)
+                {
+                    if (lease.ClientKey == clientKey && lease.Status == "Active")
+                    {
+                        lease.Status = "Released";
+                        lease.ExpiresAt = DateTime.UtcNow;
+                    }
+                }
+            }
+        }
+        else if (messageType == 8)
+        {
+            SendReply(packet, length, 5, 0);
+        }
+    }
+
+    private uint SelectAddress(string clientKey, DateTime now)
+    {
+        Cleanup(now);
+        foreach (NICChangerDhcpLeaseEntry lease in _leases)
+            if (lease.ClientKey == clientKey && lease.Status == "Active") return lease.Address;
+
+        NICChangerDhcpOffer existingOffer;
+        if (_offers.TryGetValue(clientKey, out existingOffer) && existingOffer.ExpiresAt > now)
+            return existingOffer.Address;
+
+        for (uint address = _poolStart; address <= _poolEnd; address++)
+        {
+            DateTime declinedUntil;
+            if (_declined.TryGetValue(address, out declinedUntil) && declinedUntil > now) continue;
+            bool used = false;
+            foreach (NICChangerDhcpLeaseEntry lease in _leases)
+                if (lease.Address == address && lease.Status == "Active") { used = true; break; }
+            if (!used)
+            {
+                foreach (NICChangerDhcpOffer offer in _offers.Values)
+                    if (offer.Address == address && offer.ExpiresAt > now) { used = true; break; }
+            }
+            if (!used) return address;
+            if (address == UInt32.MaxValue) break;
+        }
+        return 0;
+    }
+
+    private bool AddressBelongsToOtherClient(uint address, string clientKey)
+    {
+        foreach (NICChangerDhcpLeaseEntry lease in _leases)
+            if (lease.Address == address && lease.Status == "Active" && lease.ClientKey != clientKey) return true;
+        return false;
+    }
+
+    private void CommitLease(string clientKey, uint address, string macAddress, string hostName)
+    {
+        DateTime now = DateTime.UtcNow;
+        foreach (NICChangerDhcpLeaseEntry other in _leases)
+        {
+            if (other.Address == address && other.ClientKey != clientKey && other.Status == "Active")
+            {
+                other.Status = "Expired";
+                other.ExpiresAt = now;
+            }
+        }
+
+        NICChangerDhcpLeaseEntry entry = null;
+        foreach (NICChangerDhcpLeaseEntry lease in _leases)
+            if (lease.ClientKey == clientKey) { entry = lease; break; }
+        if (entry == null)
+        {
+            entry = new NICChangerDhcpLeaseEntry();
+            entry.ClientKey = clientKey;
+            _leases.Add(entry);
+        }
+        entry.Address = address;
+        entry.MacAddress = macAddress;
+        if (!String.IsNullOrWhiteSpace(hostName) || String.IsNullOrWhiteSpace(entry.HostName))
+            entry.HostName = hostName;
+        entry.Status = "Active";
+        entry.LeasedAt = now;
+        entry.ExpiresAt = now.AddSeconds(_leaseSeconds);
+    }
+
+    private void Cleanup(DateTime now)
+    {
+        foreach (NICChangerDhcpLeaseEntry lease in _leases)
+            if (lease.Status == "Active" && lease.ExpiresAt <= now) lease.Status = "Expired";
+
+        List<string> expiredOffers = new List<string>();
+        foreach (KeyValuePair<string, NICChangerDhcpOffer> offer in _offers)
+            if (offer.Value.ExpiresAt <= now) expiredOffers.Add(offer.Key);
+        foreach (string key in expiredOffers) _offers.Remove(key);
+
+        List<uint> expiredDeclines = new List<uint>();
+        foreach (KeyValuePair<uint, DateTime> decline in _declined)
+            if (decline.Value <= now) expiredDeclines.Add(decline.Key);
+        foreach (uint address in expiredDeclines) _declined.Remove(address);
+    }
+
+    private void SendReply(byte[] request, int requestLength, byte messageType, uint offeredAddress)
+    {
+        byte[] header = new byte[240];
+        header[0] = 2;
+        header[1] = request[1];
+        header[2] = request[2];
+        header[3] = request[3];
+        Buffer.BlockCopy(request, 4, header, 4, 4);
+        Buffer.BlockCopy(request, 10, header, 10, 2);
+        if (messageType == 5 && offeredAddress == 0)
+            Buffer.BlockCopy(request, 12, header, 12, 4);
+        NICChangerDhcpProtocol.WriteUInt32(header, 16, offeredAddress);
+        NICChangerDhcpProtocol.WriteUInt32(header, 20, _serverAddressValue);
+        Buffer.BlockCopy(request, 28, header, 28, Math.Min(16, requestLength - 28));
+        header[236] = 99; header[237] = 130; header[238] = 83; header[239] = 99;
+
+        List<byte> response = new List<byte>(header);
+        NICChangerDhcpProtocol.AddOption(response, 53, new byte[] { messageType });
+        NICChangerDhcpProtocol.AddOption(response, 54, _serverAddress.GetAddressBytes());
+        if (messageType != 6)
+        {
+            NICChangerDhcpProtocol.AddOption(response, 51, NICChangerDhcpProtocol.UInt32Bytes(_leaseSeconds));
+            NICChangerDhcpProtocol.AddOption(response, 58, NICChangerDhcpProtocol.UInt32Bytes(_leaseSeconds / 2));
+            NICChangerDhcpProtocol.AddOption(response, 59, NICChangerDhcpProtocol.UInt32Bytes((_leaseSeconds * 7) / 8));
+            NICChangerDhcpProtocol.AddOption(response, 1, _subnetMask.GetAddressBytes());
+            if (_router != null) NICChangerDhcpProtocol.AddOption(response, 3, _router.GetAddressBytes());
+            NICChangerDhcpProtocol.AddOption(response, 6, NICChangerDhcpProtocol.AddressListBytes(_dnsServers));
+            NICChangerDhcpProtocol.AddOption(response, 42, NICChangerDhcpProtocol.AddressListBytes(_ntpServers));
+            if (!String.IsNullOrWhiteSpace(_domainName))
+                NICChangerDhcpProtocol.AddOption(response, 15, Encoding.ASCII.GetBytes(_domainName));
+        }
+        response.Add(255);
+        byte[] packet = response.ToArray();
+        _socket.SendTo(packet, new IPEndPoint(_broadcastAddress, 68));
+    }
+
+    public void Dispose()
+    {
+        Stop();
+    }
+}
+"@
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 
 
@@ -138,32 +758,40 @@ function Set-ButtonStyle {
 function New-StatusCard {
     param(
         [string]$Title,
-        [int]$X
+        [int]$X,
+        [int]$Width = 216
     )
 
     $panel = New-Object System.Windows.Forms.Panel
     $panel.Location = New-Object System.Drawing.Point($X, 0)
-    $panel.Size = New-Object System.Drawing.Size(216, 104)
+    $panel.Size = New-Object System.Drawing.Size($Width, 104)
     $panel.BackColor = $colorCard
 
+    # Keep enough horizontal room for single-word states such as "Connected"
+    # and "Unavailable". The previous 58 px text offset plus right padding left
+    # only 84 px in the dashboard cards, which could split a word at some DPI
+    # and font-scaling settings.
+    $textLeft = 50
+    $valueWidth = [Math]::Max(70, $Width - $textLeft - 12)
+
     $icon = New-Object System.Windows.Forms.Label
-    $icon.Location = New-Object System.Drawing.Point(16, 16)
-    $icon.Size = New-Object System.Drawing.Size(34, 34)
+    $icon.Location = New-Object System.Drawing.Point(12, 16)
+    $icon.Size = New-Object System.Drawing.Size(30, 34)
     $icon.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 18, [System.Drawing.FontStyle]::Bold)
     $icon.ForeColor = $colorMuted
     $icon.Text = ([char]0x2022).ToString()
     $icon.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
 
     $titleLabel = New-Object System.Windows.Forms.Label
-    $titleLabel.Location = New-Object System.Drawing.Point(58, 18)
-    $titleLabel.Size = New-Object System.Drawing.Size(142, 18)
+    $titleLabel.Location = New-Object System.Drawing.Point($textLeft, 18)
+    $titleLabel.Size = New-Object System.Drawing.Size($valueWidth, 18)
     $titleLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
     $titleLabel.ForeColor = $colorMuted
     $titleLabel.Text = $Title.ToUpperInvariant()
 
     $value = New-Object System.Windows.Forms.Label
-    $value.Location = New-Object System.Drawing.Point(58, 41)
-    $value.Size = New-Object System.Drawing.Size(142, 42)
+    $value.Location = New-Object System.Drawing.Point($textLeft, 41)
+    $value.Size = New-Object System.Drawing.Size($valueWidth, 42)
     $value.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12)
     $value.ForeColor = $colorText
     $value.Text = 'Not checked'
@@ -393,6 +1021,19 @@ if (Test-Path -LiteralPath $appIconPath) {
         Write-Host "Unable to load application icon: $_"
     }
 }
+else {
+    try {
+        # Packaged builds carry the icon in the executable rather than an assets folder.
+        $processPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $script:appIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($processPath)
+        if ($null -ne $script:appIcon) {
+            $form.Icon = $script:appIcon
+        }
+    }
+    catch {
+        Write-Host "Unable to load the embedded application icon: $_"
+    }
+}
 
 # Header
 $headerPanel = New-Object System.Windows.Forms.Panel
@@ -509,12 +1150,14 @@ $contentPanel.Location = New-Object System.Drawing.Point(310, 88)
 $contentPanel.Size = New-Object System.Drawing.Size(690, 584)
 $contentPanel.BackColor = $colorBackground
 
-$adapterStatusCard = New-StatusCard -Title 'Adapter' -X 0
-$internetStatusCard = New-StatusCard -Title 'Internet' -X 232
-$dnsStatusCard = New-StatusCard -Title 'DNS' -X 464
+$adapterStatusCard = New-StatusCard -Title 'Adapter' -X 0 -Width 164
+$internetStatusCard = New-StatusCard -Title 'Internet' -X 172 -Width 164
+$dnsStatusCard = New-StatusCard -Title 'DNS' -X 344 -Width 164
+$dhcpStatusCard = New-StatusCard -Title 'DHCP' -X 516 -Width 164
 $contentPanel.Controls.Add($adapterStatusCard.Panel)
 $contentPanel.Controls.Add($internetStatusCard.Panel)
 $contentPanel.Controls.Add($dnsStatusCard.Panel)
+$contentPanel.Controls.Add($dhcpStatusCard.Panel)
 
 # Address details card
 $addressPanel = New-Object System.Windows.Forms.Panel
@@ -684,17 +1327,24 @@ $btnCaptureIPtoSet.Add_Click({ Set-Captured-IP })
 
 $btnSetDhcpLinkLocal = New-Object System.Windows.Forms.Button
 $btnSetDhcpLinkLocal.Location = New-Object System.Drawing.Point(16, 166)
-$btnSetDhcpLinkLocal.Size = New-Object System.Drawing.Size(316, 42)
+$btnSetDhcpLinkLocal.Size = New-Object System.Drawing.Size(210, 42)
 $btnSetDhcpLinkLocal.Text = '&Use automatic addressing (DHCP)'
 Set-ButtonStyle -Button $btnSetDhcpLinkLocal
 $btnSetDhcpLinkLocal.Add_Click({ Set-DHCP-LinkLocal-IP })
 
 $btnSetLinkLocal = New-Object System.Windows.Forms.Button
-$btnSetLinkLocal.Location = New-Object System.Drawing.Point(348, 166)
-$btnSetLinkLocal.Size = New-Object System.Drawing.Size(316, 42)
+$btnSetLinkLocal.Location = New-Object System.Drawing.Point(235, 166)
+$btnSetLinkLocal.Size = New-Object System.Drawing.Size(210, 42)
 $btnSetLinkLocal.Text = '&Generate link-local address'
 Set-ButtonStyle -Button $btnSetLinkLocal
 $btnSetLinkLocal.Add_Click({ Set-RandomLinkLocal-IP })
+
+$btnDhcpServer = New-Object System.Windows.Forms.Button
+$btnDhcpServer.Location = New-Object System.Drawing.Point(454, 166)
+$btnDhcpServer.Size = New-Object System.Drawing.Size(210, 42)
+$btnDhcpServer.Text = '&Enable DHCP Server'
+Set-ButtonStyle -Button $btnDhcpServer
+$btnDhcpServer.Add_Click({ Show-DhcpServerDialog })
 
 $configPanel.Controls.Add($configHeading)
 $configPanel.Controls.Add($configNoticeLabel)
@@ -708,6 +1358,7 @@ $configPanel.Controls.Add($btnCaptureIP)
 $configPanel.Controls.Add($btnCaptureIPtoSet)
 $configPanel.Controls.Add($btnSetDhcpLinkLocal)
 $configPanel.Controls.Add($btnSetLinkLocal)
+$configPanel.Controls.Add($btnDhcpServer)
 $contentPanel.Controls.Add($configPanel)
 $form.Controls.Add($contentPanel)
 
@@ -727,7 +1378,8 @@ foreach ($panel in @($headerPanel, $sidebarPanel, $addressPanel, $configPanel)) 
 $adapterStatusCard.Panel.AccessibleName = 'Adapter status'
 $internetStatusCard.Panel.AccessibleName = 'Internet connectivity status'
 $dnsStatusCard.Panel.AccessibleName = 'DNS resolution status'
-foreach ($card in @($adapterStatusCard, $internetStatusCard, $dnsStatusCard)) {
+$dhcpStatusCard.Panel.AccessibleName = 'DHCP server status'
+foreach ($card in @($adapterStatusCard, $internetStatusCard, $dnsStatusCard, $dhcpStatusCard)) {
     $card.Panel.AccessibleRole = [System.Windows.Forms.AccessibleRole]::Grouping
     $card.Value.AccessibleRole = [System.Windows.Forms.AccessibleRole]::StaticText
     $card.Icon.AccessibleRole = [System.Windows.Forms.AccessibleRole]::Graphic
@@ -735,7 +1387,7 @@ foreach ($card in @($adapterStatusCard, $internetStatusCard, $dnsStatusCard)) {
 $liveSettingProperty = [System.Windows.Forms.Label].GetProperty('LiveSetting')
 if ($null -ne $liveSettingProperty) {
     $politeSetting = [System.Enum]::Parse($liveSettingProperty.PropertyType, 'Polite')
-    foreach ($statusValue in @($adapterStatusCard.Value, $internetStatusCard.Value, $dnsStatusCard.Value, $configNoticeLabel)) {
+    foreach ($statusValue in @($adapterStatusCard.Value, $internetStatusCard.Value, $dnsStatusCard.Value, $dhcpStatusCard.Value, $configNoticeLabel)) {
         $liveSettingProperty.SetValue($statusValue, $politeSetting, $null)
     }
 }
@@ -759,11 +1411,13 @@ $btnCaptureIP.AccessibleName = 'Capture current IPv4 address'
 $btnCaptureIPtoSet.AccessibleName = 'Apply static IPv4 address'
 $btnSetDhcpLinkLocal.AccessibleName = 'Use automatic DHCP addressing'
 $btnSetLinkLocal.AccessibleName = 'Generate a link-local address'
+$btnDhcpServer.AccessibleName = 'Enable DHCP Server'
 $btnScanSubnet.AccessibleName = 'Scan selected adapter subnet'
 $btnScanSubnet.AccessibleDescription = 'Ping the selected IPv4 subnet, then look up hostnames only for responding addresses.'
 $btnCaptureIPtoSet.AccessibleDescription = 'Validates and checks the address for conflicts before changing the selected adapter.'
 $btnSetDhcpLinkLocal.AccessibleDescription = 'Changes the selected adapter to automatic IPv4 addressing.'
 $btnSetLinkLocal.AccessibleDescription = 'Assigns an available address in the 169.254.0.0 slash 16 range.'
+$btnDhcpServer.AccessibleDescription = 'Checks for another DHCP server and address conflicts before opening a temporary DHCP server on the selected adapter.'
 
 $sidebarPanel.TabIndex = 0
 $contentPanel.TabIndex = 1
@@ -778,8 +1432,9 @@ $btnCaptureIP.TabIndex = 5
 $btnCaptureIPtoSet.TabIndex = 6
 $btnSetDhcpLinkLocal.TabIndex = 7
 $btnSetLinkLocal.TabIndex = 8
-$btnScanSubnet.TabIndex = 9
-$btnTheme.TabIndex = 10
+$btnDhcpServer.TabIndex = 9
+$btnScanSubnet.TabIndex = 10
+$btnTheme.TabIndex = 11
 
 $toolTip = New-Object System.Windows.Forms.ToolTip
 $toolTip.AutoPopDelay = 8000
@@ -794,6 +1449,7 @@ $toolTip.SetToolTip($textBoxCapturedIP, 'Example: 192.168.1.25')
 $toolTip.SetToolTip($textBoxCapturedSubnet, 'Example: 255.255.255.0')
 $toolTip.SetToolTip($comboCidr, 'Example: /24 is equivalent to 255.255.255.0')
 $toolTip.SetToolTip($btnScanSubnet, 'Discover responding IPv4 hosts and resolve their hostnames.')
+$toolTip.SetToolTip($btnDhcpServer, 'Safely enable or manage the temporary DHCP server on the selected adapter.')
 
 $validationErrors = New-Object System.Windows.Forms.ErrorProvider
 $validationErrors.ContainerControl = $form
@@ -837,10 +1493,10 @@ function Apply-AppTheme {
         foreach ($surface in @($headerPanel, $sidebarPanel, $addressPanel, $configPanel)) {
             $surface.BackColor = $colorSurface
         }
-        foreach ($card in @($adapterStatusCard.Panel, $internetStatusCard.Panel, $dnsStatusCard.Panel)) {
+        foreach ($card in @($adapterStatusCard.Panel, $internetStatusCard.Panel, $dnsStatusCard.Panel, $dhcpStatusCard.Panel)) {
             $card.BackColor = $colorCard
         }
-        foreach ($statusCard in @($adapterStatusCard, $internetStatusCard, $dnsStatusCard)) {
+        foreach ($statusCard in @($adapterStatusCard, $internetStatusCard, $dnsStatusCard, $dhcpStatusCard)) {
             $statusCard.Title.ForeColor = $colorMuted
             Set-StatusCard -Card $statusCard -Text $statusCard.Value.Text -State $statusCard.State
         }
@@ -874,6 +1530,8 @@ function Apply-AppTheme {
         Set-ButtonStyle -Button $btnCaptureIP
         Set-ButtonStyle -Button $btnSetDhcpLinkLocal
         Set-ButtonStyle -Button $btnSetLinkLocal
+        Set-ButtonStyle -Button $btnDhcpServer
+        Update-DhcpServerButton
         Set-ButtonStyle -Button $btnScanSubnet
         Set-ButtonStyle -Button $btnCaptureIPtoSet -BackColor $colorAccent -HoverColor $colorAccentHover
         $highContrastEnabled = [System.Windows.Forms.SystemInformation]::HighContrast
@@ -928,7 +1586,12 @@ $script:emptyAdapterLabel = $null
 $script:suppressAdapterFilterEvent = $false
 $script:selectedAdapterHasIPv4 = $false
 $script:selectedAdapterCanConfigure = $true
-$ButtonGroup = ($btnSetLinkLocal, $btnSetDhcpLinkLocal, $btnCaptureIPtoSet, $btnCaptureIP)
+$script:dhcpServer = $null
+$script:dhcpConfiguration = $null
+$script:dhcpFirewallRuleName = $null
+$script:dhcpStatusRetryTimer = $null
+$script:dhcpStatusRetryInterface = $null
+$ButtonGroup = ($btnSetLinkLocal, $btnSetDhcpLinkLocal, $btnDhcpServer, $btnCaptureIPtoSet, $btnCaptureIP)
 
 function ButtonGroupEnable {
     param(
@@ -939,6 +1602,8 @@ function ButtonGroupEnable {
 
     $btnSetLinkLocal.Enabled = $buttonsEnabled
     $btnSetDhcpLinkLocal.Enabled = $buttonsEnabled
+    $serverIsRunning = $null -ne $script:dhcpServer -and $script:dhcpServer.IsRunning
+    $btnDhcpServer.Enabled = $serverIsRunning -or ($buttonsEnabled -and $script:selectedAdapterHasIPv4)
     $btnCaptureIP.Enabled = $buttonsEnabled
     $btnScanSubnet.Enabled = $enable -and $interfaceSelected -and $script:selectedAdapterHasIPv4
     Update-CapturedIPButton -EnableGroup:$enable
@@ -1560,6 +2225,1004 @@ function Start-SubnetScan {
     $scanForm.Dispose()
 }
 
+function Get-DhcpAdapterSettings {
+    param([string]$InterfaceAlias)
+
+    if ([string]::IsNullOrWhiteSpace($InterfaceAlias)) {
+        throw 'Select a network adapter first.'
+    }
+
+    $adapter = Get-NetAdapter -InterfaceAlias $InterfaceAlias -ErrorAction Stop
+    if ($adapter.Status -ne 'Up') {
+        throw "The selected adapter is $($adapter.Status). Connect it before enabling the DHCP server."
+    }
+
+    $addresses = @(Get-NetIPAddress -InterfaceAlias $InterfaceAlias -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object {
+                $_.PrefixLength -le 30 -and $_.IPAddress -ne '0.0.0.0' -and
+                $_.IPAddress -notlike '127.*' -and $_.AddressState -ne 'Duplicate'
+            } |
+            Sort-Object @{ Expression = { if ($_.IPAddress -like '169.254.*') { 1 } else { 0 } } },
+            @{ Expression = { if ($_.PrefixOrigin -eq 'Manual') { 0 } else { 1 } } })
+
+    if ($addresses.Count -eq 0) {
+        throw 'The selected adapter needs an IPv4 address with a /30 or larger subnet before NIC Changer can inspect it for DHCP service.'
+    }
+
+    $address = $addresses[0]
+    return [PSCustomObject]@{
+        AdapterAlias  = $InterfaceAlias
+        InterfaceIndex = [int]$adapter.ifIndex
+        ServerAddress = $address.IPAddress
+        PrefixLength  = [int]$address.PrefixLength
+        SubnetMask    = Convert-PrefixToSubnetMask -PrefixLength ([int]$address.PrefixLength)
+        PrefixOrigin  = $address.PrefixOrigin.ToString()
+        IsStatic      = $address.PrefixOrigin -eq 'Manual'
+    }
+}
+
+function Get-DhcpPoolDefaults {
+    param([PSCustomObject]$AdapterSettings)
+
+    $serverValue = Convert-IPv4ToUInt32 -Address $AdapterSettings.ServerAddress
+    $blockSize = [uint64][Math]::Pow(2, 32 - $AdapterSettings.PrefixLength)
+    $network = [uint64]([Math]::Floor($serverValue / $blockSize) * $blockSize)
+    $broadcast = $network + $blockSize - 1
+    $segments = @()
+
+    if ($serverValue -gt ($network + 1)) {
+        $segments += [PSCustomObject]@{ Start = $network + 1; End = $serverValue - 1 }
+    }
+    if ($serverValue -lt ($broadcast - 1)) {
+        $segments += [PSCustomObject]@{ Start = $serverValue + 1; End = $broadcast - 1 }
+    }
+    if ($segments.Count -eq 0) {
+        throw 'This subnet has no usable client addresses outside the server address.'
+    }
+
+    $preferredStart = $network + 100
+    $segment = $segments |
+        Sort-Object @{ Expression = {
+                    if ($preferredStart -ge $_.Start -and $preferredStart -le $_.End) { 0 } else { 1 }
+                } }, @{ Expression = { -($_.End - $_.Start + 1) } } |
+        Select-Object -First 1
+
+    $segmentCapacity = [uint64]($segment.End - $segment.Start + 1)
+    $poolSize = [int][Math]::Min(20, $segmentCapacity)
+    $poolStart = if ($preferredStart -ge $segment.Start -and
+        ($preferredStart + $poolSize - 1) -le $segment.End) {
+        $preferredStart
+    }
+    else {
+        $segment.Start
+    }
+
+    return [PSCustomObject]@{
+        PoolStart   = Convert-UInt32ToIPv4 -Value $poolStart
+        PoolSize    = $poolSize
+        MaxPoolSize = [int][Math]::Min(250, $segmentCapacity)
+        Network     = $network
+        Broadcast   = $broadcast
+    }
+}
+
+function ConvertTo-DhcpIPv4List {
+    param(
+        [string]$Text,
+        [string]$FieldName
+    )
+
+    $addresses = @()
+    if (-not [string]::IsNullOrWhiteSpace($Text)) {
+        foreach ($value in @($Text -split '[,;\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })) {
+            if (-not (Test-ValidIPv4Address -Address $value)) {
+                throw "$FieldName contains an invalid IPv4 address: $value"
+            }
+            if ($value -notin $addresses) {
+                $addresses += $value
+            }
+        }
+    }
+    return @($addresses)
+}
+
+function Test-DhcpConfiguration {
+    param(
+        [PSCustomObject]$AdapterSettings,
+        [string]$PoolStart,
+        [int]$PoolSize,
+        [int]$LeaseMinutes,
+        [string]$Router,
+        [string]$DnsText,
+        [string]$NtpText,
+        [string]$DomainName
+    )
+
+    if (-not (Test-ValidIPv4Address -Address $PoolStart)) {
+        throw 'Enter a valid IPv4 address for the pool start.'
+    }
+    if ($PoolSize -lt 1 -or $PoolSize -gt 250) {
+        throw 'Pool size must be between 1 and 250 addresses.'
+    }
+    if ($LeaseMinutes -lt 1 -or $LeaseMinutes -gt 10080) {
+        throw 'Lease time must be between 1 minute and 7 days.'
+    }
+
+    $serverValue = Convert-IPv4ToUInt32 -Address $AdapterSettings.ServerAddress
+    $blockSize = [uint64][Math]::Pow(2, 32 - $AdapterSettings.PrefixLength)
+    $network = [uint64]([Math]::Floor($serverValue / $blockSize) * $blockSize)
+    $broadcast = $network + $blockSize - 1
+    $poolStartValue = Convert-IPv4ToUInt32 -Address $PoolStart
+    $poolEndValue = $poolStartValue + [uint64]$PoolSize - 1
+
+    if ($poolStartValue -le $network -or $poolEndValue -ge $broadcast -or $poolEndValue -lt $poolStartValue) {
+        throw "The complete pool must be inside $((Convert-UInt32ToIPv4 -Value $network))/$($AdapterSettings.PrefixLength) and cannot include its network or broadcast address."
+    }
+    if ($serverValue -ge $poolStartValue -and $serverValue -le $poolEndValue) {
+        throw "The pool includes this computer's server address, $($AdapterSettings.ServerAddress)."
+    }
+
+    $routerValue = $Router.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($routerValue) -and -not (Test-ValidIPv4Address -Address $routerValue)) {
+        throw 'Enter a valid IPv4 router address or leave the router field blank.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($routerValue)) {
+        $routerNumber = Convert-IPv4ToUInt32 -Address $routerValue
+        if ($routerNumber -le $network -or $routerNumber -ge $broadcast) {
+            throw 'The router address must be on the selected adapter subnet.'
+        }
+    }
+
+    $dnsAddresses = @(ConvertTo-DhcpIPv4List -Text $DnsText -FieldName 'DNS servers')
+    $ntpAddresses = @(ConvertTo-DhcpIPv4List -Text $NtpText -FieldName 'NTP servers')
+    if ($dnsAddresses.Count -gt 31 -or $ntpAddresses.Count -gt 31) {
+        throw 'DNS and NTP lists can each contain at most 31 IPv4 addresses.'
+    }
+
+    $reservedAddresses = @($routerValue) + $dnsAddresses + $ntpAddresses |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
+    foreach ($reservedAddress in $reservedAddresses) {
+        $reservedValue = Convert-IPv4ToUInt32 -Address $reservedAddress
+        if ($reservedValue -ge $poolStartValue -and $reservedValue -le $poolEndValue) {
+            throw "The pool includes configured infrastructure address $reservedAddress. Move it outside the pool."
+        }
+    }
+
+    $domain = $DomainName.Trim()
+    if ($domain.Length -gt 253 -or ($domain.Length -gt 0 -and $domain -notmatch '^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$')) {
+        throw 'The domain name may contain letters, numbers, periods, and hyphens, and cannot begin or end with punctuation.'
+    }
+
+    $poolAddresses = for ($value = $poolStartValue; $value -le $poolEndValue; $value++) {
+        Convert-UInt32ToIPv4 -Value $value
+    }
+
+    return [PSCustomObject]@{
+        AdapterAlias  = $AdapterSettings.AdapterAlias
+        InterfaceIndex = $AdapterSettings.InterfaceIndex
+        ServerAddress = $AdapterSettings.ServerAddress
+        PrefixLength  = $AdapterSettings.PrefixLength
+        SubnetMask    = $AdapterSettings.SubnetMask
+        PoolStart     = $PoolStart
+        PoolEnd       = Convert-UInt32ToIPv4 -Value $poolEndValue
+        PoolSize      = $PoolSize
+        PoolAddresses = @($poolAddresses)
+        LeaseMinutes  = $LeaseMinutes
+        Router        = $routerValue
+        DnsServers    = @($dnsAddresses)
+        NtpServers    = @($ntpAddresses)
+        DomainName    = $domain
+    }
+}
+
+function Test-DhcpPoolAvailability {
+    param(
+        [string[]]$Addresses,
+        [string]$SourceAddress,
+        [System.Windows.Forms.Label]$StatusLabel
+    )
+
+    $activeAddresses = New-Object System.Collections.Generic.List[string]
+    $pending = New-Object System.Collections.Generic.List[object]
+    $nextAddressIndex = 0
+    $checked = 0
+    $batchSize = 12
+
+    try {
+        while ($nextAddressIndex -lt $Addresses.Count -or $pending.Count -gt 0) {
+            while ($nextAddressIndex -lt $Addresses.Count -and $pending.Count -lt $batchSize) {
+                $address = $Addresses[$nextAddressIndex]
+                $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $processInfo.FileName = 'ping.exe'
+                $processInfo.Arguments = "-S $SourceAddress -n 1 -w 700 $address"
+                $processInfo.UseShellExecute = $false
+                $processInfo.CreateNoWindow = $true
+                $processInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+                $process = New-Object System.Diagnostics.Process
+                $process.StartInfo = $processInfo
+                if (-not $process.Start()) {
+                    throw "Unable to start the ping safety check for $address."
+                }
+                $pending.Add([PSCustomObject]@{ Address = $address; Process = $process })
+                $nextAddressIndex++
+            }
+
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 20
+            for ($index = $pending.Count - 1; $index -ge 0; $index--) {
+                $item = $pending[$index]
+                if ($item.Process.HasExited) {
+                    if ($item.Process.ExitCode -eq 0) {
+                        $activeAddresses.Add($item.Address)
+                    }
+                    $item.Process.Dispose()
+                    $pending.RemoveAt($index)
+                    $checked++
+                    if ($null -ne $StatusLabel -and -not $StatusLabel.IsDisposed) {
+                        $StatusLabel.Text = "Ping safety check: $checked of $($Addresses.Count) addresses checked"
+                    }
+                }
+            }
+        }
+    }
+    finally {
+        foreach ($item in $pending.ToArray()) {
+            try {
+                if (-not $item.Process.HasExited) {
+                    $item.Process.Kill()
+                    $item.Process.WaitForExit(250) | Out-Null
+                }
+            }
+            catch {
+                # The short-lived ping process may have exited between checks.
+            }
+            finally {
+                $item.Process.Dispose()
+            }
+        }
+    }
+
+    return $activeAddresses.ToArray()
+}
+
+function Get-WindowsDhcpLeaseInfo {
+    param([string]$InterfaceAlias)
+
+    try {
+        $adapter = Get-NetAdapter -InterfaceAlias $InterfaceAlias -ErrorAction Stop
+        $adapterGuid = if ($null -ne $adapter.InterfaceGuid) { $adapter.InterfaceGuid.ToString().Trim('{}') } else { '' }
+        $configurations = @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration `
+                -Filter 'IPEnabled = TRUE' -ErrorAction Stop)
+
+        $configuration = $configurations |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($adapterGuid) -and
+                -not [string]::IsNullOrWhiteSpace($_.SettingID) -and
+                $_.SettingID.ToString().Trim('{}') -eq $adapterGuid
+            } |
+            Select-Object -First 1
+        if ($null -eq $configuration) {
+            $configuration = $configurations |
+                Where-Object { [uint32]$_.InterfaceIndex -eq [uint32]$adapter.ifIndex } |
+                Select-Object -First 1
+        }
+
+        if ($null -eq $configuration) {
+            return [PSCustomObject]@{
+                QuerySucceeded = $true
+                ConfigurationFound = $false
+                DhcpEnabled    = $false
+                HasActiveLease = $false
+                ServerAddress  = $null
+                LeaseObtained  = $null
+                LeaseExpires   = $null
+                Error          = $null
+            }
+        }
+
+        $serverAddress = $configuration.DHCPServer
+        $serverIsValid = Test-ValidIPv4Address -Address $serverAddress
+        if ($serverAddress -in @('0.0.0.0', '255.255.255.255')) {
+            $serverIsValid = $false
+        }
+
+        $dhcpAddresses = @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 `
+                -PrefixOrigin Dhcp -ErrorAction SilentlyContinue |
+                Where-Object { $_.AddressState -ne 'Duplicate' })
+
+        $leaseExpires = $configuration.DHCPLeaseExpires
+        $leaseObtained = $configuration.DHCPLeaseObtained
+        $expirationIsKnown = $null -ne $leaseExpires -and $leaseExpires -is [DateTime] -and
+            $leaseExpires -gt [DateTime]'1970-01-01'
+        $leaseIsCurrent = -not $expirationIsKnown -or $leaseExpires -gt (Get-Date)
+        $hasActiveLease = [bool]$configuration.DHCPEnabled -and $serverIsValid -and
+            $dhcpAddresses.Count -gt 0 -and $leaseIsCurrent
+
+        return [PSCustomObject]@{
+            QuerySucceeded = $true
+            ConfigurationFound = $true
+            DhcpEnabled    = [bool]$configuration.DHCPEnabled
+            HasActiveLease = $hasActiveLease
+            ServerAddress  = if ($serverIsValid) { $serverAddress } else { $null }
+            LeaseObtained  = $leaseObtained
+            LeaseExpires   = $leaseExpires
+            Error          = $null
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            QuerySucceeded = $false
+            ConfigurationFound = $false
+            DhcpEnabled    = $false
+            HasActiveLease = $false
+            ServerAddress  = $null
+            LeaseObtained  = $null
+            LeaseExpires   = $null
+            Error          = $_.Exception.Message
+        }
+    }
+}
+
+function Test-ExistingDhcpServer {
+    param(
+        [PSCustomObject]$AdapterSettings,
+        [int]$TimeoutMilliseconds = 3000
+    )
+
+    $windowsLease = Get-WindowsDhcpLeaseInfo -InterfaceAlias $AdapterSettings.AdapterAlias
+    if ($windowsLease.HasActiveLease) {
+        return [PSCustomObject]@{
+            ServerFound     = $true
+            ServerIdentifier = $windowsLease.ServerAddress
+            SourceAddress   = $windowsLease.ServerAddress
+            Error           = $null
+            DetectionMethod = 'Windows active lease'
+            LeaseExpires    = $windowsLease.LeaseExpires
+        }
+    }
+
+    $serverValue = Convert-IPv4ToUInt32 -Address $AdapterSettings.ServerAddress
+    $blockSize = [uint64][Math]::Pow(2, 32 - $AdapterSettings.PrefixLength)
+    $network = [uint64]([Math]::Floor($serverValue / $blockSize) * $blockSize)
+    $broadcastAddress = Convert-UInt32ToIPv4 -Value ($network + $blockSize - 1)
+    $probe = $null
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $probe = [NICChangerDhcpProbe]::Probe($AdapterSettings.InterfaceIndex, $broadcastAddress, $TimeoutMilliseconds)
+        if ([string]::IsNullOrWhiteSpace($probe.Error)) {
+            break
+        }
+        if ($attempt -lt 3) {
+            # Windows can retain DHCP client port 68 briefly while an adapter is
+            # transitioning from automatic to static addressing.
+            Start-Sleep -Milliseconds (250 * $attempt)
+        }
+    }
+    return [PSCustomObject]@{
+        ServerFound     = $probe.ServerFound
+        ServerIdentifier = $probe.ServerIdentifier
+        SourceAddress   = $probe.SourceAddress
+        Error           = $probe.Error
+        DetectionMethod = 'Active discovery'
+        LeaseExpires    = $null
+    }
+}
+
+function Start-DhcpStatusRetry {
+    if ($null -ne $script:dhcpStatusRetryTimer) {
+        $script:dhcpStatusRetryTimer.Stop()
+        $script:dhcpStatusRetryTimer.Dispose()
+    }
+
+    $script:dhcpStatusRetryInterface = $script:selectedInterface
+    $script:dhcpStatusRetryTimer = New-Object System.Windows.Forms.Timer
+    $script:dhcpStatusRetryTimer.Interval = 1500
+    $script:dhcpStatusRetryTimer.Add_Tick({
+            $script:dhcpStatusRetryTimer.Stop()
+            $script:dhcpStatusRetryTimer.Dispose()
+            $script:dhcpStatusRetryTimer = $null
+            if ($script:selectedInterface -eq $script:dhcpStatusRetryInterface -and
+                $null -ne $form -and -not $form.IsDisposed) {
+                Update-DhcpStatusCard -IsRetry
+            }
+        })
+    $script:dhcpStatusRetryTimer.Start()
+}
+
+function Update-DhcpStatusCard {
+    param([switch]$IsRetry)
+
+    if ($null -eq $dhcpStatusCard -or $dhcpStatusCard.Panel.IsDisposed) {
+        return
+    }
+
+    $selectedInterface = $script:selectedInterface
+    $localServerIsSelected = $null -ne $script:dhcpServer -and $script:dhcpServer.IsRunning -and
+        $null -ne $script:dhcpConfiguration -and
+        $script:dhcpConfiguration.AdapterAlias -eq $selectedInterface
+
+    if ($localServerIsSelected) {
+        Set-StatusCard -Card $dhcpStatusCard -Text 'This tool' -State Success
+        $details = "NIC Changer is serving DHCP on $selectedInterface."
+        $dhcpStatusCard.Value.AccessibleDescription = $details
+        if ($null -ne $toolTip) { $toolTip.SetToolTip($dhcpStatusCard.Panel, $details) }
+        return
+    }
+
+    if ([string]::IsNullOrWhiteSpace($selectedInterface)) {
+        Set-StatusCard -Card $dhcpStatusCard -Text 'Not checked' -State Neutral
+        return
+    }
+    if (-not $script:selectedAdapterHasIPv4) {
+        Set-StatusCard -Card $dhcpStatusCard -Text 'No IPv4' -State Neutral
+        return
+    }
+
+    Set-StatusCard -Card $dhcpStatusCard -Text 'Checking...' -State Pending
+    $dhcpStatusCard.Panel.Refresh()
+    $shouldRetry = $false
+    try {
+        $adapterSettings = Get-DhcpAdapterSettings -InterfaceAlias $selectedInterface
+        $probe = Test-ExistingDhcpServer -AdapterSettings $adapterSettings -TimeoutMilliseconds 1500
+        if (-not [string]::IsNullOrWhiteSpace($probe.Error)) {
+            Set-StatusCard -Card $dhcpStatusCard -Text 'Unable to check' -State Failure
+            $details = "DHCP discovery failed: $($probe.Error)"
+            $shouldRetry = $true
+        }
+        elseif ($probe.ServerFound) {
+            Set-StatusCard -Card $dhcpStatusCard -Text 'External server' -State Success
+            $details = "An external DHCP server was detected at $($probe.ServerIdentifier) using $($probe.DetectionMethod)."
+            if ($null -ne $probe.LeaseExpires) {
+                $details += " The Windows lease expires $($probe.LeaseExpires.ToString('g'))."
+            }
+        }
+        else {
+            Set-StatusCard -Card $dhcpStatusCard -Text 'No server' -State Neutral
+            $details = 'No DHCP server answered the discovery probe on the selected adapter.'
+        }
+    }
+    catch {
+        Set-StatusCard -Card $dhcpStatusCard -Text 'Unable to check' -State Failure
+        $details = "DHCP discovery failed: $($_.Exception.Message)"
+        $shouldRetry = $true
+    }
+
+    $dhcpStatusCard.Value.AccessibleDescription = $details
+    if ($null -ne $toolTip) { $toolTip.SetToolTip($dhcpStatusCard.Panel, $details) }
+    if ($shouldRetry -and -not $IsRetry) {
+        Start-DhcpStatusRetry
+    }
+}
+
+function Add-DhcpFirewallRule {
+    param([string]$InterfaceAlias)
+
+    $ruleName = "NICChanger-Temporary-DHCP-$PID-$([Guid]::NewGuid().ToString('N'))"
+    New-NetFirewallRule -Name $ruleName -DisplayName 'NIC Changer temporary DHCP server' `
+        -Description "Temporary inbound DHCP rule created by NIC Changer process $PID. Remove when the server stops." `
+        -Group 'NIC Changer Temporary DHCP' -Direction Inbound -Action Allow -Enabled True `
+        -Protocol UDP -LocalPort 67 -InterfaceAlias $InterfaceAlias -Profile Any `
+        -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+    $script:dhcpFirewallRuleName = $ruleName
+}
+
+function Remove-DhcpFirewallRule {
+    if (-not [string]::IsNullOrWhiteSpace($script:dhcpFirewallRuleName)) {
+        try {
+            Remove-NetFirewallRule -Name $script:dhcpFirewallRuleName -PolicyStore ActiveStore -ErrorAction Stop
+        }
+        catch {
+            Write-Host "Unable to remove temporary DHCP firewall rule: $_"
+        }
+        finally {
+            $script:dhcpFirewallRuleName = $null
+        }
+    }
+}
+
+function Stop-NICChangerDhcpServer {
+    if ($null -ne $script:dhcpServer) {
+        try {
+            $script:dhcpServer.Stop()
+        }
+        catch {
+            Write-Host "Unable to stop DHCP server cleanly: $_"
+        }
+    }
+    Remove-DhcpFirewallRule
+    if ($null -ne $btnDhcpServer -and -not $btnDhcpServer.IsDisposed) {
+        Update-DhcpServerButton
+        ButtonGroupEnable($true)
+    }
+}
+
+function Update-DhcpServerButton {
+    if ($null -eq $btnDhcpServer -or $btnDhcpServer.IsDisposed) {
+        return
+    }
+
+    $serverIsRunning = $null -ne $script:dhcpServer -and $script:dhcpServer.IsRunning
+    if ($serverIsRunning) {
+        $btnDhcpServer.Text = '&Manage DHCP Server (running)'
+        $btnDhcpServer.AccessibleName = 'Manage running DHCP Server'
+        $btnDhcpServer.AccessibleDescription = 'Opens the running temporary DHCP server to view leases or stop it.'
+        Set-ButtonStyle -Button $btnDhcpServer -BackColor $colorAccent -HoverColor $colorAccentHover
+    }
+    else {
+        $btnDhcpServer.Text = '&Enable DHCP Server'
+        $btnDhcpServer.AccessibleName = 'Enable DHCP Server'
+        $btnDhcpServer.AccessibleDescription = 'Checks for another DHCP server and address conflicts before opening a temporary DHCP server on the selected adapter.'
+        Set-ButtonStyle -Button $btnDhcpServer
+    }
+}
+
+function New-DhcpDialogLabel {
+    param(
+        [System.Windows.Forms.Control]$Parent,
+        [string]$Text,
+        [int]$X,
+        [int]$Y,
+        [int]$Width
+    )
+
+    $label = New-Object System.Windows.Forms.Label
+    $label.Location = New-Object System.Drawing.Point($X, $Y)
+    $label.Size = New-Object System.Drawing.Size($Width, 18)
+    $label.ForeColor = $colorMuted
+    $label.Text = $Text
+    $Parent.Controls.Add($label)
+    return $label
+}
+
+function New-DhcpDialogTextBox {
+    param(
+        [System.Windows.Forms.Control]$Parent,
+        [string]$Text,
+        [int]$X,
+        [int]$Y,
+        [int]$Width,
+        [switch]$ReadOnly
+    )
+
+    $textBox = New-Object System.Windows.Forms.TextBox
+    $textBox.Location = New-Object System.Drawing.Point($X, $Y)
+    $textBox.Size = New-Object System.Drawing.Size($Width, 27)
+    $textBox.BackColor = $colorInput
+    $textBox.ForeColor = $colorText
+    $textBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $textBox.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $textBox.Text = $Text
+    $textBox.ReadOnly = $ReadOnly
+    $Parent.Controls.Add($textBox)
+    return $textBox
+}
+
+function Show-DhcpServerDialog {
+    $serverIsRunning = $null -ne $script:dhcpServer -and $script:dhcpServer.IsRunning
+    if (-not $serverIsRunning -and -not [string]::IsNullOrWhiteSpace($script:dhcpFirewallRuleName)) {
+        Remove-DhcpFirewallRule
+        Update-DhcpServerButton
+    }
+    $adapterSettings = $null
+    $defaults = $null
+
+    if ($serverIsRunning) {
+        $adapterSettings = $script:dhcpConfiguration
+    }
+    else {
+        try {
+            $adapterSettings = Get-DhcpAdapterSettings -InterfaceAlias $script:selectedInterface
+            $defaults = Get-DhcpPoolDefaults -AdapterSettings $adapterSettings
+        }
+        catch {
+            [Windows.Forms.MessageBox]::Show(
+                $_.Exception.Message,
+                'DHCP Server Cannot Start',
+                [Windows.Forms.MessageBoxButtons]::OK,
+                [Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+
+        $previousNotice = $configNoticeLabel.Text
+        $configNoticeLabel.Text = 'Checking for an existing DHCP server...'
+        $form.UseWaitCursor = $true
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            $probe = Test-ExistingDhcpServer -AdapterSettings $adapterSettings
+        }
+        finally {
+            $form.UseWaitCursor = $false
+            $configNoticeLabel.Text = $previousNotice
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($probe.Error)) {
+            Set-StatusCard -Card $dhcpStatusCard -Text 'Unable to check' -State Failure
+            [Windows.Forms.MessageBox]::Show(
+                "NIC Changer could not verify that this network is free of DHCP servers:`r`n`r`n$($probe.Error)`r`n`r`nNo DHCP server was enabled because the safety check must succeed first.",
+                'DHCP Safety Check Failed',
+                [Windows.Forms.MessageBoxButtons]::OK,
+                [Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+        if ($probe.ServerFound) {
+            Set-StatusCard -Card $dhcpStatusCard -Text 'External server' -State Success
+            $dhcpStatusCard.Value.AccessibleDescription = "An external DHCP server was detected at $($probe.ServerIdentifier) using $($probe.DetectionMethod)."
+            [Windows.Forms.MessageBox]::Show(
+                "An existing DHCP server was detected on $($adapterSettings.AdapterAlias).`r`n`r`nServer: $($probe.ServerIdentifier)`r`nDetected by: $($probe.DetectionMethod)`r`n`r`nNIC Changer did not enable another server because competing DHCP servers can give devices conflicting network settings.",
+                'Existing DHCP Server Detected',
+                [Windows.Forms.MessageBoxButtons]::OK,
+                [Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+        Set-StatusCard -Card $dhcpStatusCard -Text 'No server' -State Neutral
+        if (-not $adapterSettings.IsStatic) {
+            [Windows.Forms.MessageBox]::Show(
+                'No DHCP server answered the safety probe, but the selected adapter does not have a static IPv4 address. Assign a static address to this adapter before starting the temporary DHCP server so its server address cannot change.',
+                'Static IPv4 Address Required',
+                [Windows.Forms.MessageBoxButtons]::OK,
+                [Windows.Forms.MessageBoxIcon]::Warning
+            ) | Out-Null
+            return
+        }
+    }
+
+    if ($null -eq $defaults) {
+        $defaults = Get-DhcpPoolDefaults -AdapterSettings $adapterSettings
+    }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = 'Temporary DHCP Server'
+    $dialog.ClientSize = New-Object System.Drawing.Size(780, 650)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dialog.MaximizeBox = $false
+    $dialog.MinimizeBox = $false
+    $dialog.BackColor = $colorBackground
+    $dialog.ForeColor = $colorText
+    $dialog.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $dialog.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    if ($null -ne $script:appIcon) { $dialog.Icon = $script:appIcon }
+
+    $heading = New-Object System.Windows.Forms.Label
+    $heading.Location = New-Object System.Drawing.Point(20, 16)
+    $heading.Size = New-Object System.Drawing.Size(740, 28)
+    $heading.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 15)
+    $heading.ForeColor = $colorText
+    $heading.Text = 'Temporary DHCP Server'
+    $dialog.Controls.Add($heading)
+
+    $description = New-Object System.Windows.Forms.Label
+    $description.Location = New-Object System.Drawing.Point(20, 48)
+    $description.Size = New-Object System.Drawing.Size(740, 38)
+    $description.ForeColor = $colorMuted
+    $description.Text = 'For direct, temporary device setup only. NIC Changer checks for another DHCP server and pings every pool address before listening.'
+    $dialog.Controls.Add($description)
+
+    New-DhcpDialogLabel -Parent $dialog -Text 'ADAPTER / SERVER ADDRESS' -X 20 -Y 92 -Width 350 | Out-Null
+    New-DhcpDialogLabel -Parent $dialog -Text 'SUBNET MASK' -X 392 -Y 92 -Width 170 | Out-Null
+    $textServer = New-DhcpDialogTextBox -Parent $dialog -Text "$($adapterSettings.AdapterAlias)  |  $($adapterSettings.ServerAddress)/$($adapterSettings.PrefixLength)" -X 20 -Y 112 -Width 350 -ReadOnly
+    $textMask = New-DhcpDialogTextBox -Parent $dialog -Text $adapterSettings.SubnetMask -X 392 -Y 112 -Width 170 -ReadOnly
+
+    New-DhcpDialogLabel -Parent $dialog -Text 'POOL START' -X 20 -Y 154 -Width 200 | Out-Null
+    New-DhcpDialogLabel -Parent $dialog -Text 'POOL SIZE' -X 242 -Y 154 -Width 120 | Out-Null
+    New-DhcpDialogLabel -Parent $dialog -Text 'LEASE (MINUTES)' -X 384 -Y 154 -Width 160 | Out-Null
+    $initialPoolStart = if ($serverIsRunning) { $script:dhcpConfiguration.PoolStart } else { $defaults.PoolStart }
+    $initialPoolSize = if ($serverIsRunning) { $script:dhcpConfiguration.PoolSize } else { $defaults.PoolSize }
+    $initialLeaseMinutes = if ($serverIsRunning) { $script:dhcpConfiguration.LeaseMinutes } else { 120 }
+    $textPoolStart = New-DhcpDialogTextBox -Parent $dialog -Text $initialPoolStart -X 20 -Y 174 -Width 200
+
+    $numberPoolSize = New-Object System.Windows.Forms.NumericUpDown
+    $numberPoolSize.Location = New-Object System.Drawing.Point(242, 174)
+    $numberPoolSize.Size = New-Object System.Drawing.Size(120, 27)
+    $numberPoolSize.Minimum = 1
+    $numberPoolSize.Maximum = 250
+    $numberPoolSize.Value = $initialPoolSize
+    $numberPoolSize.BackColor = $colorInput
+    $numberPoolSize.ForeColor = $colorText
+    $dialog.Controls.Add($numberPoolSize)
+
+    $numberLease = New-Object System.Windows.Forms.NumericUpDown
+    $numberLease.Location = New-Object System.Drawing.Point(384, 174)
+    $numberLease.Size = New-Object System.Drawing.Size(160, 27)
+    $numberLease.Minimum = 1
+    $numberLease.Maximum = 10080
+    $numberLease.Value = $initialLeaseMinutes
+    $numberLease.BackColor = $colorInput
+    $numberLease.ForeColor = $colorText
+    $dialog.Controls.Add($numberLease)
+
+    New-DhcpDialogLabel -Parent $dialog -Text 'ROUTER / GATEWAY (OPTIONAL)' -X 20 -Y 216 -Width 220 | Out-Null
+    New-DhcpDialogLabel -Parent $dialog -Text 'DNS SERVERS (COMMA-SEPARATED)' -X 278 -Y 216 -Width 230 | Out-Null
+    New-DhcpDialogLabel -Parent $dialog -Text 'NTP SERVERS (COMMA-SEPARATED)' -X 520 -Y 216 -Width 240 | Out-Null
+    $initialRouter = if ($serverIsRunning) { $script:dhcpConfiguration.Router } else { '' }
+    $initialDns = if ($serverIsRunning) { $script:dhcpConfiguration.DnsServers -join ', ' } else { '' }
+    $initialNtp = if ($serverIsRunning) { $script:dhcpConfiguration.NtpServers -join ', ' } else { '' }
+    $textRouter = New-DhcpDialogTextBox -Parent $dialog -Text $initialRouter -X 20 -Y 236 -Width 236
+    $textDns = New-DhcpDialogTextBox -Parent $dialog -Text $initialDns -X 278 -Y 236 -Width 220
+    $textNtp = New-DhcpDialogTextBox -Parent $dialog -Text $initialNtp -X 520 -Y 236 -Width 240
+
+    New-DhcpDialogLabel -Parent $dialog -Text 'DOMAIN NAME (OPTIONAL)' -X 20 -Y 278 -Width 230 | Out-Null
+    $initialDomain = if ($serverIsRunning) { $script:dhcpConfiguration.DomainName } else { '' }
+    $textDomain = New-DhcpDialogTextBox -Parent $dialog -Text $initialDomain -X 20 -Y 298 -Width 236
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Location = New-Object System.Drawing.Point(278, 290)
+    $statusLabel.Size = New-Object System.Drawing.Size(482, 40)
+    $statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $statusLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9)
+    $statusLabel.ForeColor = if ($serverIsRunning) { $colorSuccess } else { $colorMuted }
+    $statusLabel.Text = if ($serverIsRunning) {
+        "Running on $($script:dhcpConfiguration.AdapterAlias); pool $($script:dhcpConfiguration.PoolStart) - $($script:dhcpConfiguration.PoolEnd)"
+    }
+    else {
+        'Ready. Enabling will repeat the DHCP-server check, then ping the complete pool.'
+    }
+    $dialog.Controls.Add($statusLabel)
+
+    $btnServerAction = New-Object System.Windows.Forms.Button
+    $btnServerAction.Location = New-Object System.Drawing.Point(20, 345)
+    $btnServerAction.Size = New-Object System.Drawing.Size(236, 38)
+    $btnServerAction.Text = if ($serverIsRunning) { '&Stop DHCP Server' } else { '&Enable DHCP Server' }
+    Set-ButtonStyle -Button $btnServerAction -BackColor $(if ($serverIsRunning) { $colorFailure } else { $colorAccent }) -HoverColor $(if ($serverIsRunning) { $colorFailure } else { $colorAccentHover })
+    $dialog.Controls.Add($btnServerAction)
+
+    $btnCloseDhcp = New-Object System.Windows.Forms.Button
+    $btnCloseDhcp.Location = New-Object System.Drawing.Point(624, 345)
+    $btnCloseDhcp.Size = New-Object System.Drawing.Size(136, 38)
+    $btnCloseDhcp.Text = '&Close'
+    Set-ButtonStyle -Button $btnCloseDhcp
+    $btnCloseDhcp.Add_Click({ $dialog.Close() })
+    $dialog.Controls.Add($btnCloseDhcp)
+    $dialog.CancelButton = $btnCloseDhcp
+
+    $leaseHeading = New-Object System.Windows.Forms.Label
+    $leaseHeading.Location = New-Object System.Drawing.Point(20, 398)
+    $leaseHeading.Size = New-Object System.Drawing.Size(740, 24)
+    $leaseHeading.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
+    $leaseHeading.ForeColor = $colorText
+    $leaseHeading.Text = 'Devices issued an address'
+    $dialog.Controls.Add($leaseHeading)
+
+    $leaseList = New-Object System.Windows.Forms.ListView
+    $leaseList.Location = New-Object System.Drawing.Point(20, 426)
+    $leaseList.Size = New-Object System.Drawing.Size(740, 198)
+    $leaseList.View = [System.Windows.Forms.View]::Details
+    $leaseList.FullRowSelect = $true
+    $leaseList.GridLines = $true
+    $leaseList.BackColor = $colorInput
+    $leaseList.ForeColor = $colorText
+    $leaseList.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $leaseList.Columns.Add('IP address', 120) | Out-Null
+    $leaseList.Columns.Add('MAC address', 145) | Out-Null
+    $leaseList.Columns.Add('Host name', 135) | Out-Null
+    $leaseList.Columns.Add('Status', 75) | Out-Null
+    $leaseList.Columns.Add('Leased at', 120) | Out-Null
+    $leaseList.Columns.Add('Expires at', 120) | Out-Null
+    $leaseList.AccessibleName = 'Devices issued addresses by the temporary DHCP server'
+    $dialog.Controls.Add($leaseList)
+
+    $dialog.AccessibleName = 'Temporary DHCP Server'
+    $dialog.AccessibleDescription = 'Configure, enable, monitor, and stop a temporary DHCP server on the selected adapter.'
+    $textServer.AccessibleName = 'DHCP server adapter and address'
+    $textMask.AccessibleName = 'DHCP subnet mask'
+    $textPoolStart.AccessibleName = 'DHCP pool start address'
+    $numberPoolSize.AccessibleName = 'DHCP pool size'
+    $numberLease.AccessibleName = 'DHCP lease duration in minutes'
+    $textRouter.AccessibleName = 'Optional router or gateway address'
+    $textDns.AccessibleName = 'DNS server addresses'
+    $textNtp.AccessibleName = 'NTP server addresses'
+    $textDomain.AccessibleName = 'Optional domain name'
+    $statusLabel.AccessibleName = 'DHCP server status'
+    $btnServerAction.AccessibleName = if ($serverIsRunning) { 'Stop DHCP Server' } else { 'Enable DHCP Server' }
+    $btnCloseDhcp.AccessibleName = 'Close DHCP server window'
+    $dialogLiveSettingProperty = [System.Windows.Forms.Label].GetProperty('LiveSetting')
+    if ($null -ne $dialogLiveSettingProperty) {
+        $dialogPoliteSetting = [System.Enum]::Parse($dialogLiveSettingProperty.PropertyType, 'Polite')
+        $dialogLiveSettingProperty.SetValue($statusLabel, $dialogPoliteSetting, $null)
+    }
+
+    $configurationControls = @($textPoolStart, $numberPoolSize, $numberLease, $textRouter, $textDns, $textNtp, $textDomain)
+    foreach ($control in $configurationControls) { $control.Enabled = -not $serverIsRunning }
+
+    $refreshLeases = {
+        if ($null -eq $script:dhcpServer) { return }
+        $leases = @($script:dhcpServer.GetLeases())
+        $leaseList.BeginUpdate()
+        try {
+            $leaseList.Items.Clear()
+            foreach ($lease in $leases) {
+                $item = New-Object System.Windows.Forms.ListViewItem($lease.IPAddress)
+                $item.SubItems.Add($lease.MacAddress) | Out-Null
+                $item.SubItems.Add($(if ([string]::IsNullOrWhiteSpace($lease.HostName)) { ([char]0x2014).ToString() } else { $lease.HostName })) | Out-Null
+                $item.SubItems.Add($lease.Status) | Out-Null
+                $item.SubItems.Add($lease.LeasedAt.ToString('yyyy-MM-dd HH:mm:ss')) | Out-Null
+                $item.SubItems.Add($lease.ExpiresAt.ToString('yyyy-MM-dd HH:mm:ss')) | Out-Null
+                $leaseList.Items.Add($item) | Out-Null
+            }
+            if ($leases.Count -eq 0) {
+                $emptyItem = New-Object System.Windows.Forms.ListViewItem('No devices have received an address yet.')
+                $emptyItem.ForeColor = $colorMuted
+                $leaseList.Items.Add($emptyItem) | Out-Null
+            }
+        }
+        finally {
+            $leaseList.EndUpdate()
+        }
+    }
+
+    $btnServerAction.Add_Click({
+            if ($null -ne $script:dhcpServer -and $script:dhcpServer.IsRunning) {
+                Stop-NICChangerDhcpServer
+                Update-DhcpStatusCard
+                $statusLabel.Text = 'DHCP server stopped. Lease history remains visible for this session.'
+                $statusLabel.ForeColor = $colorMuted
+                $btnServerAction.Text = '&Enable DHCP Server'
+                $btnServerAction.AccessibleName = 'Enable DHCP Server'
+                Set-ButtonStyle -Button $btnServerAction -BackColor $colorAccent -HoverColor $colorAccentHover
+                foreach ($control in $configurationControls) { $control.Enabled = $true }
+                return
+            }
+
+            try {
+                $currentAdapterSettings = Get-DhcpAdapterSettings -InterfaceAlias $adapterSettings.AdapterAlias
+                if (-not $currentAdapterSettings.IsStatic) {
+                    throw 'The selected adapter no longer has a static IPv4 address.'
+                }
+                if ($currentAdapterSettings.ServerAddress -ne $adapterSettings.ServerAddress -or
+                    $currentAdapterSettings.PrefixLength -ne $adapterSettings.PrefixLength) {
+                    throw 'The adapter address or subnet changed while this window was open. Close and reopen the DHCP server window to recalculate a safe pool.'
+                }
+
+                $configuration = Test-DhcpConfiguration -AdapterSettings $currentAdapterSettings `
+                    -PoolStart $textPoolStart.Text.Trim() -PoolSize ([int]$numberPoolSize.Value) `
+                    -LeaseMinutes ([int]$numberLease.Value) -Router $textRouter.Text `
+                    -DnsText $textDns.Text -NtpText $textNtp.Text -DomainName $textDomain.Text
+
+                $btnServerAction.Enabled = $false
+                $btnCloseDhcp.Enabled = $false
+                $dialog.ControlBox = $false
+                foreach ($control in $configurationControls) { $control.Enabled = $false }
+                $dialog.UseWaitCursor = $true
+                $statusLabel.ForeColor = $colorWarning
+                $statusLabel.Text = 'Checking again for an existing DHCP server...'
+                [System.Windows.Forms.Application]::DoEvents()
+
+                $probe = Test-ExistingDhcpServer -AdapterSettings $currentAdapterSettings
+                if (-not [string]::IsNullOrWhiteSpace($probe.Error)) {
+                    Set-StatusCard -Card $dhcpStatusCard -Text 'Unable to check' -State Failure
+                    throw "The DHCP safety check could not complete: $($probe.Error)"
+                }
+                if ($probe.ServerFound) {
+                    Set-StatusCard -Card $dhcpStatusCard -Text 'External server' -State Success
+                    $dhcpStatusCard.Value.AccessibleDescription = "An external DHCP server was detected at $($probe.ServerIdentifier) using $($probe.DetectionMethod)."
+                    [Windows.Forms.MessageBox]::Show(
+                        "An existing DHCP server was detected before startup.`r`n`r`nServer: $($probe.ServerIdentifier)`r`nDetected by: $($probe.DetectionMethod)`r`n`r`nNIC Changer stopped the operation to avoid competing DHCP servers and conflicting client settings.",
+                        'Existing DHCP Server Detected',
+                        [Windows.Forms.MessageBoxButtons]::OK,
+                        [Windows.Forms.MessageBoxIcon]::Warning
+                    ) | Out-Null
+                    $statusLabel.Text = 'Not enabled: another DHCP server answered the safety probe.'
+                    $statusLabel.ForeColor = $colorFailure
+                    return
+                }
+                Set-StatusCard -Card $dhcpStatusCard -Text 'No server' -State Neutral
+
+                $statusLabel.Text = "Pinging all $($configuration.PoolSize) addresses in the proposed pool..."
+                [System.Windows.Forms.Application]::DoEvents()
+                $addressesInUse = @(Test-DhcpPoolAvailability -Addresses $configuration.PoolAddresses `
+                        -SourceAddress $configuration.ServerAddress -StatusLabel $statusLabel)
+                if ($addressesInUse.Count -gt 0) {
+                    $preview = ($addressesInUse | Select-Object -First 12) -join ', '
+                    if ($addressesInUse.Count -gt 12) { $preview += ", and $($addressesInUse.Count - 12) more" }
+                    [Windows.Forms.MessageBox]::Show(
+                        "The following proposed lease addresses replied to ping:`r`n`r`n$preview`r`n`r`nNo DHCP server was enabled. Move the pool to an unused range or remove the conflicting devices, then try again.",
+                        'DHCP Pool Addresses Already In Use',
+                        [Windows.Forms.MessageBoxButtons]::OK,
+                        [Windows.Forms.MessageBoxIcon]::Warning
+                    ) | Out-Null
+                    $statusLabel.Text = "Not enabled: $($addressesInUse.Count) pool address(es) replied to ping."
+                    $statusLabel.ForeColor = $colorFailure
+                    return
+                }
+
+                $statusLabel.Text = 'Opening the temporary firewall rule and starting DHCP...'
+                [System.Windows.Forms.Application]::DoEvents()
+                Add-DhcpFirewallRule -InterfaceAlias $configuration.AdapterAlias
+                $candidateServer = $null
+                try {
+                    $candidateServer = New-Object NICChangerDhcpServer(
+                        $configuration.ServerAddress,
+                        $configuration.InterfaceIndex,
+                        $configuration.PoolStart,
+                        $configuration.PoolSize,
+                        $configuration.SubnetMask,
+                        $configuration.Router,
+                        [string[]]$configuration.DnsServers,
+                        [string[]]$configuration.NtpServers,
+                        $configuration.DomainName,
+                        $configuration.LeaseMinutes
+                    )
+                    $candidateServer.Start()
+                }
+                catch {
+                    if ($null -ne $candidateServer) { $candidateServer.Dispose() }
+                    Remove-DhcpFirewallRule
+                    throw
+                }
+
+                $script:dhcpServer = $candidateServer
+                $script:dhcpConfiguration = $configuration
+                Update-DhcpServerButton
+                Update-DhcpStatusCard
+                $statusLabel.Text = "Running on $($configuration.AdapterAlias); pool $($configuration.PoolStart) - $($configuration.PoolEnd)"
+                $statusLabel.ForeColor = $colorSuccess
+                $btnServerAction.Text = '&Stop DHCP Server'
+                $btnServerAction.AccessibleName = 'Stop DHCP Server'
+                Set-ButtonStyle -Button $btnServerAction -BackColor $colorFailure -HoverColor $colorFailure
+                $btnDhcpServer.Enabled = $true
+                & $refreshLeases
+            }
+            catch {
+                $statusLabel.Text = "DHCP server not enabled: $($_.Exception.Message)"
+                $statusLabel.ForeColor = $colorFailure
+                [Windows.Forms.MessageBox]::Show(
+                    "NIC Changer did not enable the DHCP server:`r`n`r`n$($_.Exception.Message)",
+                    'DHCP Server Cannot Start',
+                    [Windows.Forms.MessageBoxButtons]::OK,
+                    [Windows.Forms.MessageBoxIcon]::Warning
+                ) | Out-Null
+            }
+            finally {
+                $dialog.UseWaitCursor = $false
+                $dialog.ControlBox = $true
+                $btnCloseDhcp.Enabled = $true
+                $btnServerAction.Enabled = $true
+                $stillRunning = $null -ne $script:dhcpServer -and $script:dhcpServer.IsRunning
+                if (-not $stillRunning) {
+                    foreach ($control in $configurationControls) { $control.Enabled = $true }
+                }
+            }
+        })
+
+    $leaseTimer = New-Object System.Windows.Forms.Timer
+    $leaseTimer.Interval = 1000
+    $leaseTimer.Add_Tick({
+            if ($null -ne $script:dhcpServer) {
+                & $refreshLeases
+                if (-not $script:dhcpServer.IsRunning -and
+                    -not [string]::IsNullOrWhiteSpace($script:dhcpServer.LastError) -and
+                    -not [string]::IsNullOrWhiteSpace($script:dhcpFirewallRuleName)) {
+                    Remove-DhcpFirewallRule
+                    $statusLabel.Text = "DHCP server stopped unexpectedly: $($script:dhcpServer.LastError)"
+                    $statusLabel.ForeColor = $colorFailure
+                    $btnServerAction.Text = '&Enable DHCP Server'
+                    $btnServerAction.AccessibleName = 'Enable DHCP Server'
+                    Set-ButtonStyle -Button $btnServerAction -BackColor $colorAccent -HoverColor $colorAccentHover
+                    foreach ($control in $configurationControls) { $control.Enabled = $true }
+                    Update-DhcpServerButton
+                    Update-DhcpStatusCard
+                    ButtonGroupEnable($true)
+                }
+            }
+        })
+
+    $dialog.Add_Shown({
+            [NICChangerNativeV2]::SetDarkTitleBar($dialog.Handle, -not [Windows.Forms.SystemInformation]::HighContrast -and $script:themeMode -eq 'Dark')
+            & $refreshLeases
+            $leaseTimer.Start()
+        })
+    $dialog.Add_FormClosed({
+            $leaseTimer.Stop()
+            $leaseTimer.Dispose()
+        })
+
+    [void]$dialog.ShowDialog($form)
+    $dialog.Dispose()
+}
+
 
 # Function to set the DHCP and Link Local IP for the selected interface
 function Set-DHCP-LinkLocal-IP {
@@ -1841,6 +3504,7 @@ function Get-SelectedInterfaceInfo {
         Set-StatusCard -Card $adapterStatusCard -Text 'Checking...' -State Pending
         Set-StatusCard -Card $internetStatusCard -Text 'Checking...' -State Pending
         Set-StatusCard -Card $dnsStatusCard -Text 'Checking...' -State Pending
+        Set-StatusCard -Card $dhcpStatusCard -Text 'Checking...' -State Pending
         $lblAdapterTypeValue.Text = 'Detecting...'
         $lblMacAddressValue.Text = 'Loading...'
         $lblIPv4Value.Text = 'Loading...'
@@ -1907,10 +3571,13 @@ function Get-SelectedInterfaceInfo {
                 else {
                     Set-StatusCard -Card $dnsStatusCard -Text 'No reply' -State Failure
                 }
+
+                Update-DhcpStatusCard
             }
             else {
                 Set-StatusCard -Card $internetStatusCard -Text 'No IPv4' -State Failure
                 Set-StatusCard -Card $dnsStatusCard -Text 'Not tested' -State Neutral
+                Set-StatusCard -Card $dhcpStatusCard -Text 'No IPv4' -State Neutral
             }
 
             Write-Host "Setting Capture to Set button text"
@@ -1927,6 +3594,7 @@ function Get-SelectedInterfaceInfo {
             Set-StatusCard -Card $adapterStatusCard -Text 'Error' -State Failure
             Set-StatusCard -Card $internetStatusCard -Text 'Not tested' -State Neutral
             Set-StatusCard -Card $dnsStatusCard -Text 'Not tested' -State Neutral
+            Set-StatusCard -Card $dhcpStatusCard -Text 'Unable to check' -State Failure
             $script:selectedAdapterCanConfigure = $false
             $script:selectedAdapterHasIPv4 = $false
             $lblAdapterTypeValue.Text = 'Unable to identify adapter'
@@ -2093,10 +3761,41 @@ Apply-AppTheme -Mode $script:themeMode
 # Keep interface actions disabled until the user selects an interface.
 ButtonGroupEnable($false)
 
+$dhcpHealthTimer = New-Object System.Windows.Forms.Timer
+$dhcpHealthTimer.Interval = 2000
+$dhcpHealthTimer.Add_Tick({
+        if ($null -ne $script:dhcpServer -and -not $script:dhcpServer.IsRunning -and
+            -not [string]::IsNullOrWhiteSpace($script:dhcpFirewallRuleName)) {
+            $serverError = $script:dhcpServer.LastError
+            Remove-DhcpFirewallRule
+            Update-DhcpServerButton
+            Update-DhcpStatusCard
+            ButtonGroupEnable($true)
+            if (-not [string]::IsNullOrWhiteSpace($serverError)) {
+                $configNoticeLabel.Text = "DHCP server stopped: $serverError"
+            }
+        }
+    })
+
 # Set form event handler
 $form.Add_Shown({
         [NICChangerNativeV2]::SetDarkTitleBar($form.Handle, $script:themeMode -eq 'Dark')
         Get-NetworkInterface
+        $dhcpHealthTimer.Start()
+    })
+
+$form.Add_FormClosing({
+        $dhcpHealthTimer.Stop()
+        if ($null -ne $script:dhcpStatusRetryTimer) {
+            $script:dhcpStatusRetryTimer.Stop()
+            $script:dhcpStatusRetryTimer.Dispose()
+            $script:dhcpStatusRetryTimer = $null
+        }
+        Stop-NICChangerDhcpServer
+    })
+
+$form.Add_FormClosed({
+        $dhcpHealthTimer.Dispose()
     })
 
 # Display the form
