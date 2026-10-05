@@ -1,19 +1,24 @@
 # NIC_Changer
 
-Tool to quickly change Windows network interface settings
+Windows network tool built for Audio Visual and IoT engineers.
 
-## Overview
+## Features
 
-Windows-Native GUI interface built for Audio Visual technicians or anyone who needs to quickly switch between DHCP, Link-Local, and Static IP addresses.
+- Quickly set multiple NIC addresses between DHCP, Link-Local, and Static IP assignments
+- Quickly change static IP addresses
+- Host a temporary local DHCP server on networks where none are present
+- Scan networks to find and report devices, host names and MAC addresses
+- Overview of network services per NIC, such as internet connectivity and DNS server statuses
+- Hyper-V vEthernet awareness: easier to set the correct interface
+- Windows native. This is just a PowerShell script with no additional dependencies
 
-This is essentially one large powershell script with no additional dependencies.
-
-![app picture](/assets/app_pic.png)
+![app picture](/assets/app_pic_v2_1_0.png)
+![dhcp server](/assets/dhcp_server.png)
 ![subnet scan](/assets/subnet_scan.png)
 
 ## Quickstart
 
-All you need to is run `NIC_Changer.ps1`.
+Download a tagged Windows build from the workflow artifacts on the repository's **Actions** page, or run `NIC_Changer.ps1` directly.
 
 If you have issues due to security settings, simply copy the code from `NIC_Changer.ps1` into Notepad, then save the file as `File name: NIC_Changer.ps1` and `Save as type: All files (*.*)`
 
@@ -21,25 +26,15 @@ If you have issues due to security settings, simply copy the code from `NIC_Chan
 
 This project builds upon the work of alecdvor. Their repository <https://github.com/alecdvor/netChanger/> provided the foundation for this project.
 
-## Changes Made
+## Changelog
 
-### Version 1
+### v2.1.0
 
-- Hide the console window
-- Add check for admin rights
-- Add 'try to re-launch as admin' method
-- Add subnet mask feature and GUI element
-- GUI Improvements
-(perception of responsiveness, disable buttons when busy)
+- Added the ability to host a DHCP server on networks where there are none
+- Added DHCP server status (external, internal, none)
+- Update CI/CD to build a .exe upon release
 
-- Change function name (to clear an unapproved verb warning)
-- Add debugging prints.  These print when the console is shown.
-- Changed "Force Link Local" to check for address availiability first
-(slightly more RFC 3927 compliant)
-- Removed unused VLAN code and references
-- Fixed "Internet Connection" bug where the test was not using the selected adapter
-
-### Version 2
+### v2.0.0
 
 - Complete GUI overhaul, with dark mode option
 - Subnet scanning, searching, and reporting to return active IP addresses, host names, and MAC addresses per interface.
@@ -50,3 +45,19 @@ This project builds upon the work of alecdvor. Their repository <https://github.
 - Input verification
 - Enhanced adapter type checking and filtering, including support for vEthernet and virtual switches found in Hyper-V enabled PC's
 - Accessibility improvements
+
+### v1.0.0
+
+- Hide the console window
+- Add check for admin rights
+- Add 'try to re-launch as admin' method
+- Add subnet mask feature and GUI element
+- GUI Improvements
+(perception of responsiveness, disable buttons when busy)
+- Change function name (to clear an unapproved verb warning)
+- Add debugging prints.  These print when the console is shown.
+- Changed "Force Link Local" to check for address availability first
+(slightly more RFC 3927 compliant)
+- Removed unused VLAN code and references
+- Fixed "Internet Connection" bug where the test was not using the selected adapter
+- Remove .exe in favor of running the .ps1 file directly
