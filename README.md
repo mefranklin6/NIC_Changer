@@ -18,7 +18,7 @@ Windows network tool built for Audio Visual and IoT engineers.
 
 ## Quickstart
 
-Download a tagged Windows build from the workflow artifacts on the repository's **Actions** page, or run `NIC_Changer.ps1` directly.
+Download the .exe [from the latest release](https://github.com/mefranklin6/NIC_Changer/releases/latest), or run `NIC_Changer.ps1` directly.
 
 If you have issues due to security settings, simply copy the code from `NIC_Changer.ps1` into Notepad, then save the file as `File name: NIC_Changer.ps1` and `Save as type: All files (*.*)`
 
@@ -27,6 +27,10 @@ If you have issues due to security settings, simply copy the code from `NIC_Chan
 This project builds upon the work of alecdvor. Their repository <https://github.com/alecdvor/netChanger/> provided the foundation for this project.
 
 ## Changelog
+
+### v2.1.1
+
+- Fix issue where the .exe artifact was not being included in Releases
 
 ### v2.1.0
 
