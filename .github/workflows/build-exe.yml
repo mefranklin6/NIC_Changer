@@ -4,24 +4,35 @@ on:
   push:
     tags:
       - '*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing Git tag to build and publish
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   build:
-    name: Build tagged executable
+    name: Build and publish tagged executable
     runs-on: windows-latest
 
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Prepare version information
         id: version
         shell: powershell
         run: |
-          $tag = '${{ github.ref_name }}'
+          $tag = $env:RELEASE_TAG
           $safeTag = $tag -replace '[^0-9A-Za-z._-]', '-'
           if ([string]::IsNullOrWhiteSpace($safeTag)) {
               $safeTag = 'tagged-build'
@@ -84,3 +95,32 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+      - name: Attach executable to GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          $assets = @(
+              (Resolve-Path 'dist\NIC_Changer-${{ steps.version.outputs.safe_tag }}.exe').Path
+              (Resolve-Path 'dist\SHA256SUMS.txt').Path
+          )
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+              gh release upload $tag @assets --clobber --repo $env:GITHUB_REPOSITORY
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Unable to upload assets to the existing GitHub Release for $tag."
+              }
+          }
+          else {
+              gh release create $tag @assets `
+                  --verify-tag `
+                  --generate-notes `
+                  --title "NIC Changer $tag" `
+                  --repo $env:GITHUB_REPOSITORY
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Unable to create the GitHub Release for $tag."
+              }
+          }
