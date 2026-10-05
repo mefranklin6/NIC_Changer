@@ -28,6 +28,10 @@ This project builds upon the work of alecdvor. Their repository <https://github.
 
 ## Changelog
 
+### v2.1.2
+
+- Fix excessive popups when running the .exe (comment out informational Write-Host lines)
+
 ### v2.1.1
 
 - Fix issue where the .exe artifact was not being included in Releases
